@@ -1,0 +1,10 @@
+streamlit
+geemap
+earthengine-api
+geopandas
+shapely
+pandas
+sqlalchemy
+psycopg2-binary
+datetime
+

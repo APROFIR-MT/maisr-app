@@ -23,9 +23,14 @@ if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
 # ---------- Autenticação Earth Engine ----------
-SERVICE_ACCOUNT = 'gee-streamlit-app@ee-lucaseducarvalho.iam.gserviceaccount.com'
-KEY_FILE = os.path.join('key', 'ee_credentials.json')  # para deploy, troque por st.secrets
-credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
+SERVICE_ACCOUNT = st.secrets["ee"]["email"]
+EE_KEY_JSON = st.secrets["ee"]["key_json"]
+
+EE_KEY_PATH = "/tmp/ee_service_account.json"  # arquivo temporário
+with open(EE_KEY_PATH, "w", encoding="utf-8") as f:
+    f.write(EE_KEY_JSON)
+
+credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, EE_KEY_PATH)
 ee.Initialize(credentials)
 
 # ---------- Camadas do usuário ----------

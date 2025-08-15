@@ -24,15 +24,22 @@ if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
 # ---------- Autenticação Earth Engine ----------
-# Caminho temporário seguro para salvar a chave
+try:
+    service_account_email = st.secrets["earthengine"]["email"]
+    service_account_key_json = st.secrets["earthengine"]["key_json"]
+except KeyError:
+    st.error(
+        "❌ Credenciais do Earth Engine não encontradas em `st.secrets['earthengine']`.\n\n"
+        "Crie `.streamlit/secrets.toml` (local) ou adicione em Settings → Secrets (no Cloud) com:\n\n"
+        "[earthengine]\nemail = \"...@...iam.gserviceaccount.com\"\nkey_json = \"\"\"{... ee_credentials.json ...}\"\"\"\n"
+    )
+    st.stop()
+
+# Caminho temporário (compatível com Windows/Linux)
 EE_KEY_PATH = os.path.join(tempfile.gettempdir(), "ee_service_account.json")
-
-# Grava o conteúdo da chave JSON no arquivo temporário
 with open(EE_KEY_PATH, "w", encoding="utf-8") as f:
-    f.write(st.secrets["earthengine"]["key_json"])
+    f.write(service_account_key_json)
 
-# Inicializa o Earth Engine com a service account
-service_account_email = st.secrets["earthengine"]["email"]
 credentials = ee.ServiceAccountCredentials(service_account_email, EE_KEY_PATH)
 ee.Initialize(credentials)
 

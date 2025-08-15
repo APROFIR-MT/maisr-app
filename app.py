@@ -4,6 +4,7 @@ import base64
 import json
 import streamlit as st
 import tempfile
+from google.oauth2 import service_account
 import ee
 import pandas as pd
 import altair as alt
@@ -24,23 +25,14 @@ if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
 # ---------- Autenticação Earth Engine ----------
-try:
-    service_account_email = st.secrets["earthengine"]["email"]
-    service_account_key_json = st.secrets["earthengine"]["key_json"]
-except KeyError:
-    st.error(
-        "❌ Credenciais do Earth Engine não encontradas em `st.secrets['earthengine']`.\n\n"
-        "Crie `.streamlit/secrets.toml` (local) ou adicione em Settings → Secrets (no Cloud) com:\n\n"
-        "[earthengine]\nemail = \"...@...iam.gserviceaccount.com\"\nkey_json = \"\"\"{... ee_credentials.json ...}\"\"\"\n"
-    )
-    st.stop()
+# Carrega credenciais do secrets
+service_account_info = st.secrets["earthengine"]
 
-# Caminho temporário (compatível com Windows/Linux)
-EE_KEY_PATH = os.path.join(tempfile.gettempdir(), "ee_service_account.json")
-with open(EE_KEY_PATH, "w", encoding="utf-8") as f:
-    f.write(service_account_key_json)
-
-credentials = ee.ServiceAccountCredentials(service_account_email, EE_KEY_PATH)
+# Inicializa o Earth Engine
+credentials = ee.ServiceAccountCredentials(
+    service_account_info["client_email"],
+    key_data=service_account_info["private_key"]
+)
 ee.Initialize(credentials)
 
 # ---------- Camadas do usuário ----------

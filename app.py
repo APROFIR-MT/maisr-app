@@ -16,7 +16,7 @@ from folium.plugins import MarkerCluster  # <<< clusters
 # ---------- Configuração da página ----------
 st.set_page_config(layout="wide")
 st.markdown(
-    "<h1 style='text-align:left; font-size:40px;'>🌾 NDVI MODIS + Precipitação (ERA5-Land)</h1>",
+    "<h1 style='text-align:left; font-size:40px;'>🌾 Monitoramento NDVI MODIS + Precipitação (ERA5-Land)</h1>",
     unsafe_allow_html=True
 )
 

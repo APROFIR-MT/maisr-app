@@ -3,6 +3,7 @@ import datetime
 import base64
 import json
 import streamlit as st
+import tempfile
 import ee
 import pandas as pd
 import altair as alt
@@ -23,12 +24,16 @@ if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
 # ---------- Autenticação Earth Engine ----------
-SERVICE_ACCOUNT = st.secrets["ee"]["email"]
-EE_KEY_JSON = st.secrets["ee"]["key_json"]
-EE_KEY_PATH = "/tmp/ee_service_account.json"  # arquivo temporário
+# Caminho temporário seguro para salvar a chave
+EE_KEY_PATH = os.path.join(tempfile.gettempdir(), "ee_service_account.json")
+
+# Grava o conteúdo da chave JSON no arquivo temporário
 with open(EE_KEY_PATH, "w", encoding="utf-8") as f:
-    f.write(EE_KEY_JSON)
-credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, EE_KEY_PATH)
+    f.write(st.secrets["earthengine"]["key_json"])
+
+# Inicializa o Earth Engine com a service account
+service_account_email = st.secrets["earthengine"]["email"]
+credentials = ee.ServiceAccountCredentials(service_account_email, EE_KEY_PATH)
 ee.Initialize(credentials)
 
 # ---------- Camadas do usuário ----------

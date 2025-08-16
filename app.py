@@ -1,7 +1,6 @@
 import os
 import datetime
 import base64
-import json
 
 import streamlit as st
 import ee
@@ -10,7 +9,7 @@ import altair as alt
 import folium
 import geemap  # para ee_to_geojson
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster
+from folium.plugins import MarkerCluster  # <<< clusters
 
 # ---------- Configuração da página ----------
 st.set_page_config(layout="wide")
@@ -24,15 +23,9 @@ if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
 # ---------- Autenticação Earth Engine ----------
-# Espera-se que o secrets tenha:
-# [earthengine]
-# client_email = "..."
-# private_key  = """-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"""
-service_account_info = st.secrets["earthengine"]
-credentials = ee.ServiceAccountCredentials(
-    service_account_info["client_email"],
-    key_data=service_account_info["private_key"]
-)
+SERVICE_ACCOUNT = 'gee-streamlit-app@ee-lucaseducarvalho.iam.gserviceaccount.com'
+KEY_FILE = os.path.join('key', 'ee_credentials.json')  # para deploy, troque por st.secrets
+credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
 ee.Initialize(credentials)
 
 # ---------- Camadas do usuário ----------
@@ -81,20 +74,17 @@ def compute_ndvi_series(pivo_id):
         start = ee.Date(date)
         end = start.advance(1, "month")
         filtered = modis.filterDate(start, end)
-
         def empty_case():
             return ee.Image.constant(0).rename('NDVI').clip(area).set({
                 "month": start.format("YYYY-MM"),
                 "system:time_start": start.millis()
             })
-
         def non_empty_case():
             ndvi = filtered.mean().focal_mean(3, "square", "pixels")
             return ndvi.clip(area).set({
                 "month": start.format("YYYY-MM"),
                 "system:time_start": start.millis()
             })
-
         return ee.Image(ee.Algorithms.If(filtered.size().eq(0), empty_case(), non_empty_case()))
 
     monthly_collection = ee.ImageCollection(dates.map(monthly_composite))
@@ -211,60 +201,6 @@ def segments_below_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame
         return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
     return pd.DataFrame(seg_rows, columns=['date', 'ndvi', 'seg']).drop_duplicates().sort_values('date')
 
-# ---------- TOKEN DE ATUALIZAÇÃO + CACHES ----------
-def _safe_to_yyyymm(ts_ms):
-    try:
-        return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m")
-    except Exception:
-        return "unknown"
-
-@st.cache_data(show_spinner=False)
-def get_update_token():
-    """
-    Token 'YYYY-MM|YYYY-MM' com o último mês disponível em MODIS e ERA5.
-    Muda somente quando chegam imagens novas, invalidando o cache de séries.
-    """
-    try:
-        last_modis = modis.aggregate_max('system:time_start').getInfo()
-        mm_modis = _safe_to_yyyymm(last_modis)
-    except Exception:
-        mm_modis = (datetime.datetime.utcnow().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
-
-    try:
-        last_era5 = era5.aggregate_max('system:time_start').getInfo()
-        mm_era5 = _safe_to_yyyymm(last_era5)
-    except Exception:
-        mm_era5 = (datetime.datetime.utcnow().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
-
-    return f"{mm_modis}|{mm_era5}"
-
-@st.cache_data(show_spinner=False)
-def get_series_cached(pivo_id: int, update_token: str):
-    """
-    Retorna o DataFrame combinado (NDVI + precip) para o pivô.
-    Cacheia por (pivo_id, update_token). Recalcula só quando update_token muda.
-    """
-    df_ndvi = compute_ndvi_series(pivo_id)
-    df_prec = compute_precip_series(pivo_id)
-
-    if df_ndvi is None or df_ndvi.empty:
-        df = pd.DataFrame(columns=['date', 'ndvi', 'precip_mm'])
-    else:
-        df = pd.merge(df_ndvi, df_prec, on='date', how='left')
-        df['ndvi'] = pd.to_numeric(df['ndvi'], errors='coerce')
-        df['precip_mm'] = pd.to_numeric(df.get('precip_mm', 0.0), errors='coerce').fillna(0.0)
-        df = df.dropna(subset=['ndvi']).sort_values('date')
-    return df
-
-@st.cache_data(show_spinner=False)
-def cached_geojson_from_asset(asset_id: str):
-    """
-    Converte um asset do EE (por ID) em GeoJSON válido e cacheia por asset_id.
-    Evita passar objetos do EE para o cache.
-    """
-    fc = ee.FeatureCollection(asset_id)
-    return ee_to_valid_geojson(fc)
-
 # ---------- Sidebar ----------
 pivo_ids = PIVOS_PT.aggregate_array('id_ref').sort().getInfo()
 st.sidebar.markdown("### Parâmetros")
@@ -274,10 +210,18 @@ st.sidebar.caption("Linha verde contínua. Trechos NDVI ≤ limiar: linha e pont
 
 # ---------- Fluxo principal ----------
 if selected_pivo:
-    # 1) Dados NDVI + Precip (via cache)
-    with st.spinner("🔄 Carregando séries (NDVI + Precipitação) a partir do cache..."):
-        update_token = get_update_token()       # muda quando chega mês novo nas coleções
-        df = get_series_cached(int(selected_pivo), update_token)
+    # 1) Dados NDVI + Precip
+    with st.spinner("🔄 Carregando séries (NDVI + Precipitação)..."):
+        df_ndvi = compute_ndvi_series(selected_pivo)
+        df_prec = compute_precip_series(selected_pivo)
+
+        if df_ndvi is None or df_ndvi.empty:
+            df = pd.DataFrame(columns=['date', 'ndvi', 'precip_mm'])
+        else:
+            df = pd.merge(df_ndvi, df_prec, on='date', how='left')
+            df['ndvi'] = pd.to_numeric(df['ndvi'], errors='coerce')
+            df['precip_mm'] = pd.to_numeric(df.get('precip_mm', 0.0), errors='coerce').fillna(0.0)
+            df = df.dropna(subset=['ndvi']).sort_values('date')
 
     # 2) Cards de resumo (métricas)
     st.subheader(f"Resumo do pivô {selected_pivo}")
@@ -317,7 +261,6 @@ if selected_pivo:
         modis.filterDate(last_date, ee.Date(last_date).advance(1, 'month'))
         .mean()
         .clip(PIVOS_AREA)
-        .unmask(0)  # evita tiles vazias caso não haja dado exatamente no mês
     )
     mapid = ndvi_image.getMapId({'min': 0, 'max': 1, 'palette': ['red', 'yellow', 'green']})
     folium.TileLayer(
@@ -328,9 +271,9 @@ if selected_pivo:
         control=True
     ).add_to(m)
 
-    # Áreas/Pontos (GeoJSON do cache)
-    pivos_area_geojson = cached_geojson_from_asset("users/lucaseducarvalho/PIVOS_AREA")
-    pivos_pt_geojson   = cached_geojson_from_asset("users/lucaseducarvalho/PIVOS_PT")
+    # Áreas (GeoJSON validado)
+    pivos_area_geojson = ee_to_valid_geojson(PIVOS_AREA)
+    pivos_pt_geojson = ee_to_valid_geojson(PIVOS_PT)
 
     if pivos_area_geojson['features']:
         folium.GeoJson(
@@ -341,11 +284,11 @@ if selected_pivo:
     else:
         st.warning("⚠️ Nenhuma área de pivô encontrada.")
 
-    # ---- RÓTULOS COM CLUSTER (somente DivIcon) ----
+    # ---- RÓTULOS COM CLUSTER (somente DivIcon; sem camada GeoJson de pontos) ----
     if pivos_pt_geojson['features']:
         label_cluster = MarkerCluster(
             name="Rótulos",
-            disableClusteringAtZoom=16,
+            disableClusteringAtZoom=16,   # ↑ só “explode” próximo
             showCoverageOnHover=False,
             spiderfyOnMaxZoom=True,
             zoomToBoundsOnClick=True,
@@ -356,6 +299,7 @@ if selected_pivo:
         for f in pivos_pt_geojson['features']:
             coords = f['geometry']['coordinates']
             label = str(f['properties'].get('id_ref', ''))
+            # DivIcon puro (sem imagem) para evitar ícone de “missing image”
             folium.Marker(
                 location=[coords[1], coords[0]],
                 icon=folium.DivIcon(
@@ -375,7 +319,7 @@ if selected_pivo:
                                  2px  0px 0 white;
                         ">{label}</div>
                     """,
-                    icon_size=(0, 0),
+                    icon_size=(0, 0),      # evita qualquer sprite padrão
                     icon_anchor=(0, 0),
                     class_name="pivot-label"
                 )

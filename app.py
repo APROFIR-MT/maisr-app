@@ -1,8 +1,10 @@
 import os
 import datetime
 import base64
-
+import json
 import streamlit as st
+import tempfile
+from google.oauth2 import service_account
 import ee
 import pandas as pd
 import altair as alt
@@ -23,9 +25,14 @@ if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
 # ---------- Autenticação Earth Engine ----------
-SERVICE_ACCOUNT = 'gee-streamlit-app@ee-lucaseducarvalho.iam.gserviceaccount.com'
-KEY_FILE = os.path.join('key', 'ee_credentials.json')  # para deploy, troque por st.secrets
-credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
+# Carrega credenciais do secrets
+service_account_info = st.secrets["earthengine"]
+
+# Inicializa o Earth Engine
+credentials = ee.ServiceAccountCredentials(
+    service_account_info["client_email"],
+    key_data=service_account_info["private_key"]
+)
 ee.Initialize(credentials)
 
 # ---------- Camadas do usuário ----------
@@ -74,17 +81,20 @@ def compute_ndvi_series(pivo_id):
         start = ee.Date(date)
         end = start.advance(1, "month")
         filtered = modis.filterDate(start, end)
+
         def empty_case():
             return ee.Image.constant(0).rename('NDVI').clip(area).set({
                 "month": start.format("YYYY-MM"),
                 "system:time_start": start.millis()
             })
+
         def non_empty_case():
             ndvi = filtered.mean().focal_mean(3, "square", "pixels")
             return ndvi.clip(area).set({
                 "month": start.format("YYYY-MM"),
                 "system:time_start": start.millis()
             })
+
         return ee.Image(ee.Algorithms.If(filtered.size().eq(0), empty_case(), non_empty_case()))
 
     monthly_collection = ee.ImageCollection(dates.map(monthly_composite))
@@ -112,9 +122,8 @@ def compute_ndvi_series(pivo_id):
     return df
 
 def compute_precip_series(pivo_id):
-    """
-    Precipitação acumulada mensal (mm/mês) da ERA5-Land (hourly total_precipitation em metros).
-    Soma mensal (m) -> mm (x1000). Redução espacial = média sobre a área do pivô.
+    """ Precipitação acumulada mensal (mm/mês) da ERA5-Land (hourly total_precipitation em metros).
+        Soma mensal (m) -> mm (x1000). Redução espacial = média sobre a área do pivô.
     """
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
     dates = monthly_dates()
@@ -127,11 +136,10 @@ def compute_precip_series(pivo_id):
         mean_mm = monthly_sum_mm.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=area,
-            scale=9000,           # resolução bruta ERA5-Land
+            scale=9000,  # resolução bruta ERA5-Land
             bestEffort=True,
             maxPixels=1e13
         ).get('precip_mm')
-
         return ee.Feature(None, {
             'date': start.format('YYYY-MM'),
             'precip_mm': ee.Algorithms.If(ee.Algorithms.IsEqual(mean_mm, None), 0, mean_mm)
@@ -146,33 +154,28 @@ def compute_precip_series(pivo_id):
         df = df.sort_values('date')
     return df
 
-# ---------- Helper: segmentos ≤ limiar com IDs para não conectar entre si ----------
+# ---------- Helper: segmentos ≤ limiar com IDs ----------
 def segments_below_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    """
-    Retorna apenas os trechos onde ndvi <= threshold (com pontos de cruzamento),
-    e atribui ID 'seg' para o Altair NÃO conectar segmentos distintos (detail='seg:N').
+    """Retorna trechos onde ndvi <= threshold (com pontos de cruzamento),
+       e atribui ID 'seg' para Altair NÃO conectar segmentos distintos.
     """
     if df.empty:
         return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
     df = df.sort_values('date').reset_index(drop=True)
     seg_rows, seg_id, in_seg, prev = [], 0, False, None
-
     for _, curr in df.iterrows():
         if prev is None:
             if curr['ndvi'] <= threshold:
                 seg_id += 1; in_seg = True
                 seg_rows.append({'date': curr['date'], 'ndvi': float(curr['ndvi']), 'seg': seg_id})
             prev = curr; continue
-
         p_ndvi = float(prev['ndvi']); c_ndvi = float(curr['ndvi'])
         p_below = p_ndvi <= threshold; c_below = c_ndvi <= threshold
-
         if p_below and c_below:
             if not in_seg:
                 seg_id += 1; in_seg = True
-                seg_rows.append({'date': prev['date'], 'ndvi': p_ndvi, 'seg': seg_id})
+            seg_rows.append({'date': prev['date'], 'ndvi': p_ndvi, 'seg': seg_id})
             seg_rows.append({'date': curr['date'], 'ndvi': c_ndvi, 'seg': seg_id})
-
         elif (not p_below) and c_below:
             t1_ns, t2_ns = prev['date'].value, curr['date'].value
             alpha = 0.0 if c_ndvi == p_ndvi else (threshold - p_ndvi) / (c_ndvi - p_ndvi)
@@ -181,7 +184,6 @@ def segments_below_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame
             seg_id += 1; in_seg = True
             seg_rows.append({'date': tc, 'ndvi': threshold, 'seg': seg_id})
             seg_rows.append({'date': curr['date'], 'ndvi': c_ndvi, 'seg': seg_id})
-
         elif p_below and (not c_below):
             t1_ns, t2_ns = prev['date'].value, curr['date'].value
             alpha = 0.0 if c_ndvi == p_ndvi else (threshold - p_ndvi) / (c_ndvi - p_ndvi)
@@ -189,14 +191,12 @@ def segments_below_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame
             tc = pd.to_datetime(int(round(t1_ns + alpha * (t2_ns - t1_ns))))
             if not in_seg:
                 seg_id += 1; in_seg = True
-                seg_rows.append({'date': prev['date'], 'ndvi': p_ndvi, 'seg': seg_id})
+            seg_rows.append({'date': prev['date'], 'ndvi': p_ndvi, 'seg': seg_id})
             seg_rows.append({'date': tc, 'ndvi': threshold, 'seg': seg_id})
             in_seg = False
         else:
             in_seg = False
-
         prev = curr
-
     if not seg_rows:
         return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
     return pd.DataFrame(seg_rows, columns=['date', 'ndvi', 'seg']).drop_duplicates().sort_values('date')
@@ -214,7 +214,6 @@ if selected_pivo:
     with st.spinner("🔄 Carregando séries (NDVI + Precipitação)..."):
         df_ndvi = compute_ndvi_series(selected_pivo)
         df_prec = compute_precip_series(selected_pivo)
-
         if df_ndvi is None or df_ndvi.empty:
             df = pd.DataFrame(columns=['date', 'ndvi', 'precip_mm'])
         else:
@@ -233,14 +232,13 @@ if selected_pivo:
     else:
         try:
             ult = float(df['ndvi'].iloc[-1])
-            med3 = float(df['ndvi'].tail(3).mean())
+            med3 = float(df['ndvi']].tail(3).mean())
             var = ult - float(df['ndvi'].iloc[-2]) if len(df) >= 2 else 0.0
         except Exception:
             ult, med3, var = 0.0, 0.0, 0.0
         col1.metric("NDVI último mês", f"{ult:.3f}")
         col2.metric("Média 3 meses", f"{med3:.3f}")
         col3.metric("Variação vs. mês anterior", f"{var:+.3f}")
-
     st.divider()
 
     # 3) MAPA
@@ -274,7 +272,6 @@ if selected_pivo:
     # Áreas (GeoJSON validado)
     pivos_area_geojson = ee_to_valid_geojson(PIVOS_AREA)
     pivos_pt_geojson = ee_to_valid_geojson(PIVOS_PT)
-
     if pivos_area_geojson['features']:
         folium.GeoJson(
             pivos_area_geojson,
@@ -284,22 +281,20 @@ if selected_pivo:
     else:
         st.warning("⚠️ Nenhuma área de pivô encontrada.")
 
-    # ---- RÓTULOS COM CLUSTER (somente DivIcon; sem camada GeoJson de pontos) ----
+    # ---- RÓTULOS COM CLUSTER ----
     if pivos_pt_geojson['features']:
         label_cluster = MarkerCluster(
             name="Rótulos",
-            disableClusteringAtZoom=16,   # ↑ só “explode” próximo
+            disableClusteringAtZoom=16,
             showCoverageOnHover=False,
             spiderfyOnMaxZoom=True,
             zoomToBoundsOnClick=True,
             chunkedLoading=True,
             maxClusterRadius=60
         ).add_to(m)
-
         for f in pivos_pt_geojson['features']:
             coords = f['geometry']['coordinates']
             label = str(f['properties'].get('id_ref', ''))
-            # DivIcon puro (sem imagem) para evitar ícone de “missing image”
             folium.Marker(
                 location=[coords[1], coords[0]],
                 icon=folium.DivIcon(
@@ -310,16 +305,16 @@ if selected_pivo:
                             color:black;
                             text-shadow:
                                 -2px -2px 0 white,
-                                 2px -2px 0 white,
-                                -2px  2px 0 white,
-                                 2px  2px 0 white,
-                                 0px -2px 0 white,
-                                 0px  2px 0 white,
-                                -2px  0px 0 white,
-                                 2px  0px 0 white;
+                                2px -2px 0 white,
+                                -2px 2px 0 white,
+                                2px 2px 0 white,
+                                0px -2px 0 white,
+                                0px 2px 0 white,
+                                -2px 0px 0 white,
+                                2px 0px 0 white;
                         ">{label}</div>
                     """,
-                    icon_size=(0, 0),      # evita qualquer sprite padrão
+                    icon_size=(0, 0),
                     icon_anchor=(0, 0),
                     class_name="pivot-label"
                 )
@@ -334,7 +329,6 @@ if selected_pivo:
     with tab1:
         st_folium(m, use_container_width=True, height=520)
         st.caption("Legenda NDVI: vermelho (↓) → amarelo → verde (↑). Barras: precipitação mensal acumulada (ERA5-Land).")
-
     with tab2:
         if df.empty:
             st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
@@ -343,29 +337,23 @@ if selected_pivo:
 
             bars_precip = alt.Chart(df).mark_bar(color='#3b82f6', opacity=0.5).encode(
                 x=alt.X('date:T', title='Data'),
-                y=alt.Y('precip_mm:Q', title='Precipitação (mm/mês)',
-                        axis=alt.Axis(titleColor='#3b82f6')),
+                y=alt.Y('precip_mm:Q', title='Precipitação (mm/mês)', axis=alt.Axis(titleColor='#3b82f6')),
                 tooltip=[
                     alt.Tooltip('date:T', title='Data'),
                     alt.Tooltip('precip_mm:Q', title='Precipitação (mm)', format=".2f")
                 ]
             )
-
             line_green_full = alt.Chart(df).mark_line(color='green', strokeWidth=2).encode(
                 x=alt.X('date:T', title='Data'),
-                y=alt.Y('ndvi:Q',
-                        title='NDVI',
-                        scale=ndvi_scale,
+                y=alt.Y('ndvi:Q', title='NDVI', scale=ndvi_scale,
                         axis=alt.Axis(format=".3f", orient='right', titleColor='green'))
             )
-
             df_below = segments_below_threshold(df[['date', 'ndvi']].copy(), threshold)
             line_red_overlay = alt.Chart(df_below).mark_line(color='red', strokeWidth=3).encode(
                 x='date:T',
                 y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale),
                 detail='seg:N'
             )
-
             points_green = alt.Chart(df[df['ndvi'] > threshold]).mark_point(
                 color='green', filled=True, opacity=1
             ).encode(
@@ -374,7 +362,6 @@ if selected_pivo:
                 tooltip=[alt.Tooltip('date:T', title='Data'),
                          alt.Tooltip('ndvi:Q', title='NDVI', format=".3f")]
             )
-
             points_red = alt.Chart(df[df['ndvi'] <= threshold]).mark_point(
                 color='red', filled=True, opacity=1
             ).encode(

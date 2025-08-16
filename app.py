@@ -10,7 +10,7 @@ import altair as alt
 import folium
 import geemap  # para ee_to_geojson
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster  # <<< clusters
+from folium.plugins import MarkerCluster
 
 # ---------- Configuração da página ----------
 st.set_page_config(layout="wide")
@@ -257,8 +257,12 @@ def get_series_cached(pivo_id: int, update_token: str):
     return df
 
 @st.cache_data(show_spinner=False)
-def cached_geojson(fc, name: str):
-    """Cache da conversão de FeatureCollection para GeoJSON válido."""
+def cached_geojson_from_asset(asset_id: str):
+    """
+    Converte um asset do EE (por ID) em GeoJSON válido e cacheia por asset_id.
+    Evita passar objetos do EE para o cache.
+    """
+    fc = ee.FeatureCollection(asset_id)
     return ee_to_valid_geojson(fc)
 
 # ---------- Sidebar ----------
@@ -325,8 +329,8 @@ if selected_pivo:
     ).add_to(m)
 
     # Áreas/Pontos (GeoJSON do cache)
-    pivos_area_geojson = cached_geojson(PIVOS_AREA, "PIVOS_AREA")
-    pivos_pt_geojson = cached_geojson(PIVOS_PT, "PIVOS_PT")
+    pivos_area_geojson = cached_geojson_from_asset("users/lucaseducarvalho/PIVOS_AREA")
+    pivos_pt_geojson   = cached_geojson_from_asset("users/lucaseducarvalho/PIVOS_PT")
 
     if pivos_area_geojson['features']:
         folium.GeoJson(

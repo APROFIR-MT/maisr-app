@@ -1,8 +1,8 @@
-streamlit>=1.36
-pandas>=2.0
-altair>=5.0
-earthengine-api>=1.1.1
-geemap>=0.32.0
-folium>=0.16.0
+streamlit>=1.36.0
+pandas>=2.0.0
+altair>=5.0.0
+folium>=0.15.1
 streamlit-folium>=0.20.0
-numpy>=1.26
+geemap>=0.32.0
+earthengine-api>=0.1.398
+google-auth>=2.22.0

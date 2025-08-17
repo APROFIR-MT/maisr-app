@@ -79,7 +79,7 @@ def get_base_collections():
 modis, era5 = get_base_collections()
 
 # =====================
-# DATAS MENSAIS
+# DATAS MENSAIS (até último mês completo)
 # =====================
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def monthly_dates(start_date_str='2021-01-01'):
@@ -90,9 +90,8 @@ def monthly_dates(start_date_str='2021-01-01'):
     return ee.List.sequence(0, n.subtract(1)).map(lambda m: start.advance(m, 'month'))
 
 # =====================
-# EXPORTA E LÊ REPOSITÓRIO DE CACHE
+# EXPORTA E LÊ CACHE DISCO
 # =====================
-
 def _paths_for(pivo_id: int):
     pid = int(pivo_id)
     ndvi_path = os.path.join(NDVI_CACHE, f"ndvi_{pid}.parquet")
@@ -105,7 +104,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
     dates = monthly_dates(start_date)
 
-    # ---- NDVI ----
+    # NDVI
     def monthly_ndvi(date):
         start = ee.Date(date)
         end = start.advance(1, "month")
@@ -118,7 +117,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         return ee.Image(ee.Algorithms.If(filtered.size().eq(0), empty_case(), non_empty_case()))
 
     ndvi_coll = ee.ImageCollection(dates.map(monthly_ndvi))
-
     def ndvi_extract(image):
         mean = image.reduceRegion(
             reducer=ee.Reducer.mean(), geometry=area, scale=250, bestEffort=True, maxPixels=1e13
@@ -127,7 +125,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             'date': ee.Date(image.get('system:time_start')).format('YYYY-MM'),
             'ndvi': ee.Algorithms.If(ee.Algorithms.IsEqual(mean, None), 0, mean)
         })
-
     ndvi_fc = ndvi_coll.map(ndvi_extract)
     ndvi_feats = ndvi_fc.toList(ndvi_fc.size()).getInfo()
     df_ndvi = pd.DataFrame([f['properties'] for f in ndvi_feats])
@@ -136,7 +133,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         df_ndvi['ndvi'] = pd.to_numeric(df_ndvi['ndvi'], errors='coerce')
         df_ndvi = df_ndvi.dropna(subset=['ndvi']).sort_values('date')
 
-    # ---- PRECIP ----
+    # Precip
     def month_prec(date):
         start = ee.Date(date)
         end = start.advance(1, 'month')
@@ -149,7 +146,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             'date': start.format('YYYY-MM'),
             'precip_mm': ee.Algorithms.If(ee.Algorithms.IsEqual(mean_mm, None), 0, mean_mm)
         })
-
     prec_fc = ee.FeatureCollection(dates.map(month_prec))
     prec_feats = prec_fc.toList(prec_fc.size()).getInfo()
     df_prec = pd.DataFrame([f['properties'] for f in prec_feats])
@@ -158,9 +154,8 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         df_prec['precip_mm'] = pd.to_numeric(df_prec['precip_mm'], errors='coerce').fillna(0.0)
         df_prec = df_prec.sort_values('date')
 
-    # ---- MERGE ----
+    # Merge & gravação
     df = pd.merge(df_ndvi, df_prec, on='date', how='left') if not df_ndvi.empty else pd.DataFrame(columns=['date','ndvi','precip_mm'])
-
     ndvi_path, prec_path, merged_path = _paths_for(pivo_id)
     df_ndvi.to_parquet(ndvi_path, index=False)
     df_prec.to_parquet(prec_path, index=False)
@@ -174,8 +169,22 @@ def merged_from_cache(pivo_id: int) -> pd.DataFrame:
         build_and_store_series_for_pivot(int(pivo_id))
     return pd.read_parquet(merged_path)
 
+@st.cache_data(show_spinner=True)
+def warm_cache_for_all_pivots(ids) -> int:
+    created = 0
+    for pid in ids:
+        _, _, merged_path = _paths_for(pid)
+        if not os.path.exists(merged_path):
+            build_and_store_series_for_pivot(int(pid))
+            created += 1
+    return created
+
+if len(os.listdir(MERGED_CACHE)) == 0:
+    with st.spinner("Pré-gerando cache local para todos os pivôs (primeira execução pode demorar)..."):
+        _ = warm_cache_for_all_pivots(pivo_ids)
+
 # =====================
-# MAPA OTIMIZADO
+# MAP HELPERS
 # =====================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_ndvi_mapid_for(pivo_id: int, last_date: str):
@@ -189,7 +198,7 @@ def get_ndvi_mapid_for(pivo_id: int, last_date: str):
     return ndvi_image.getMapId(vis)
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def get_selected_area_geojson(pivo_id: int, simplify_m: float = 20):
+def get_selected_area_geojson(pivo_id: int, simplify_m: float = 20.0):
     feat = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first()
     if feat is None:
         return None
@@ -209,6 +218,7 @@ def get_selected_area_geojson(pivo_id: int, simplify_m: float = 20):
 st.sidebar.markdown("### Parâmetros")
 selected_pivo = st.sidebar.selectbox("🧩 Selecione o Pivô", options=pivo_ids)
 threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
+st.sidebar.caption("Linha verde contínua. Trechos NDVI ≤ limiar: linha e pontos vermelhos. Barras: precipitação mensal (mm).")
 
 # =====================
 # FLUXO PRINCIPAL
@@ -224,7 +234,6 @@ if selected_pivo:
         else:
             df = pd.DataFrame(columns=['date','ndvi','precip_mm'])
 
-    # 2) Cards resumo
     st.subheader(f"Resumo do pivô {selected_pivo}")
     col1, col2, col3 = st.columns(3)
     if df.empty:
@@ -244,18 +253,18 @@ if selected_pivo:
 
     st.divider()
 
-    # 3) MAPA LEVE
+    # ===== MAPA OTIMIZADO =====
+    last_date_pd = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now()))
+    last_date = last_date_pd.strftime('%Y-%m-%d')
+
+    m = folium.Map(prefer_canvas=True)
     area_fc = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first()
     area_geom = area_fc.geometry()
     bounds = ee.Geometry(area_geom).bounds().coordinates().getInfo()[0]
     minx = min(c[0] for c in bounds); maxx = max(c[0] for c in bounds)
     miny = min(c[1] for c in bounds); maxy = max(c[1] for c in bounds)
-
-    m = folium.Map(prefer_canvas=True)
     m.fit_bounds([[miny, minx], [maxy, maxx]])
 
-    last_date_pd = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now()))
-    last_date = last_date_pd.strftime('%Y-%m-%d')
     mapid = get_ndvi_mapid_for(int(selected_pivo), last_date)
     folium.TileLayer(
         tiles=mapid['tile_fetcher'].url_format,
@@ -278,8 +287,10 @@ if selected_pivo:
         folium.Marker(
             location=[center[1], center[0]],
             icon=folium.DivIcon(html=f"""
-                <div style="font-size:16px; font-weight:bold; color:black;
-                    text-shadow: -2px -2px 0 white, 2px -2px 0 white, -2px 2px 0 white, 2px 2px 0 white;">{selected_pivo}</div>
+                <div style="
+                    font-size:16px; font-weight:bold; color:black;
+                    text-shadow: -2px -2px 0 white, 2px -2px 0 white,
+                                  -2px 2px 0 white, 2px 2px 0 white;">{selected_pivo}</div>
             """, icon_size=(0, 0), icon_anchor=(0, 0), class_name="pivot-label")
         ).add_to(m)
     except Exception:
@@ -288,8 +299,9 @@ if selected_pivo:
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
+        st.caption("NDVI: vermelho → amarelo → verde. Área desenhada apenas do pivô selecionado.")
 
-    # 4) GRÁFICO
+    # ===== GRÁFICO =====
     if not df.empty:
         ndvi_min = max(threshold, float(df['ndvi'].min()))
         ndvi_max = float(df['ndvi'].max())
@@ -298,12 +310,16 @@ if selected_pivo:
         bars_precip = alt.Chart(df).mark_bar(color='#3b82f6', opacity=0.5).encode(
             x=alt.X('date:T', title='Data'),
             y=alt.Y('precip_mm:Q', title='Precipitação (mm/mês)', axis=alt.Axis(titleColor='#3b82f6')),
-            tooltip=[alt.Tooltip('date:T', title='Data'), alt.Tooltip('precip_mm:Q', title='Precipitação (mm)', format=".2f")]
+            tooltip=[alt.Tooltip('date:T', title='Data'),
+                     alt.Tooltip('precip_mm:Q', title='Precipitação (mm)', format=".2f")]
         )
         line_green_full = alt.Chart(df).mark_line(color='green', strokeWidth=2).encode(
             x=alt.X('date:T', title='Data'),
-            y=alt.Y('ndvi:Q', title='NDVI', scale=ndvi_scale, axis=alt.Axis(format=".3f", orient='right', titleColor='green'))
+            y=alt.Y('ndvi:Q', title='NDVI', scale=ndvi_scale,
+                    axis=alt.Axis(format=".3f", orient='right', titleColor='green'))
         )
+
+        # pontos/segmentos abaixo do limiar
         def segments_below_threshold(local_df: pd.DataFrame, thr: float) -> pd.DataFrame:
             if local_df.empty:
                 return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
@@ -322,6 +338,59 @@ if selected_pivo:
                     seg_rows.append({'date': prev['date'], 'ndvi': p_ndvi, 'seg': seg_id})
                     seg_rows.append({'date': curr['date'], 'ndvi': c_ndvi, 'seg': seg_id})
                 elif (not p_below) and c_below:
-                    t
+                    t1, t2 = prev['date'].value, curr['date'].value
+                    alpha = 0.0 if c_ndvi == p_ndvi else (thr - p_ndvi) / (c_ndvi - p_ndvi)
+                    alpha = max(0.0, min(1.0, alpha))
+                    tc = pd.to_datetime(int(round(t1 + alpha * (t2 - t1))))
+                    seg_id += 1; in_seg = True
+                    seg_rows.append({'date': tc, 'ndvi': thr, 'seg': seg_id})
+                    seg_rows.append({'date': curr['date'], 'ndvi': c_ndvi, 'seg': seg_id})
+                elif p_below and (not c_below):
+                    t1, t2 = prev['date'].value, curr['date'].value
+                    alpha = 0.0 if c_ndvi == p_ndvi else (thr - p_ndvi) / (c_ndvi - p_ndvi)
+                    alpha = max(0.0, min(1.0, alpha))
+                    tc = pd.to_datetime(int(round(t1 + alpha * (t2 - t1))))
+                    if not in_seg: seg_id += 1; in_seg = True
+                    seg_rows.append({'date': prev['date'], 'ndvi': p_ndvi, 'seg': seg_id})
+                    seg_rows.append({'date': tc, 'ndvi': thr, 'seg': seg_id})
+                    in_seg = False
+                else:
+                    in_seg = False
+                prev = curr
+            if not seg_rows: return pd.DataFrame(columns=['date','ndvi','seg'])
+            return pd.DataFrame(seg_rows, columns=['date','ndvi','seg']).drop_duplicates().sort_values('date')
 
-```
+        df_below = segments_below_threshold(df[['date','ndvi']].copy(), threshold)
+        line_red_overlay = alt.Chart(df_below).mark_line(color='red', strokeWidth=3).encode(
+            x='date:T', y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale), detail='seg:N'
+        )
+        points_green = alt.Chart(df[df['ndvi'] > threshold]).mark_point(color='green', filled=True, opacity=1).encode(
+            x='date:T', y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale),
+            tooltip=[alt.Tooltip('date:T', title='Data'), alt.Tooltip('ndvi:Q', title='NDVI', format=".3f")]
+        )
+        points_red = alt.Chart(df[df['ndvi'] <= threshold]).mark_point(color='red', filled=True, opacity=1).encode(
+            x='date:T', y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale),
+            tooltip=[alt.Tooltip('date:T', title='Data'), alt.Tooltip('ndvi:Q', title='NDVI', format=".3f")]
+        )
+
+        chart = alt.layer(bars_precip, line_green_full, line_red_overlay, points_green, points_red
+            ).resolve_scale(y='independent'
+            ).properties(
+                title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}',
+                width='container', height=360
+            ).configure_axis(grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12
+            ).configure_view(strokeWidth=0).configure_title(fontSize=14)
+        with tab2:
+            st.altair_chart(chart, use_container_width=True)
+    else:
+        with tab2:
+            st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
+
+    # ===== EXPORT CSV =====
+    if not df.empty:
+        csv = df[['date','ndvi','precip_mm']].copy()
+        csv['date'] = csv['date'].dt.strftime('%Y-%m')
+        csv_str = csv.to_csv(index=False)
+        b64 = base64.b64encode(csv_str.encode()).decode()
+        href = f'<a href="data:text/csv;base64,{b64}" download="ndvi_precip_{selected_pivo}.csv">📥 Baixar dados (NDVI + Precip) CSV</a>'
+        st.markdown(href, unsafe_allow_html=True)

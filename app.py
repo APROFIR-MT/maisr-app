@@ -2,14 +2,21 @@ import os
 import datetime
 import base64
 import streamlit as st
-from google.oauth2 import service_account
+from google.oauth2 import service_account  # opcional; não precisa usar diretamente
 import ee
 import pandas as pd
 import altair as alt
 import folium
 import geemap
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster, BeautifyIcon
+from folium.plugins import MarkerCluster
+
+# ====== Tentativa de importar BeautifyIcon com fallback ======
+try:
+    from folium.plugins import BeautifyIcon
+    HAS_BEAUTIFY = True
+except Exception:
+    HAS_BEAUTIFY = False
 
 # =====================
 # CONFIG DA PÁGINA
@@ -38,16 +45,23 @@ for p in (CACHE_DIR, NDVI_CACHE, PREC_CACHE, MERGED_CACHE):
 # =====================
 @st.cache_resource(show_spinner=False)
 def init_ee_from_secrets():
-    service_account_info = st.secrets["earthengine"]
-    key_data = service_account_info["private_key"].replace('\\n', '\n')
-    credentials = ee.ServiceAccountCredentials(
-        service_account_info["client_email"], key_data=key_data
-    )
-    ee.Initialize(credentials)
-    return True
+    try:
+        service_account_info = st.secrets["earthengine"]
+        # Se a chave veio com "\n" literais, converte; se já tem quebras reais, não afeta.
+        key_data = service_account_info["private_key"].replace("\\n", "\n")
+        credentials = ee.ServiceAccountCredentials(
+            service_account_info["client_email"], key_data=key_data
+        )
+        ee.Initialize(credentials)
+        return True
+    except Exception as e:
+        st.error("Falha ao inicializar o Earth Engine. Verifique `st.secrets['earthengine']`.")
+        st.exception(e)
+        return False
 
 with st.spinner("Inicializando Earth Engine..."):
-    init_ee_from_secrets()
+    if not init_ee_from_secrets():
+        st.stop()
 
 # =====================
 # COLEÇÕES E LISTAS
@@ -91,7 +105,7 @@ def monthly_dates(start_date_str='2021-01-01'):
     return ee.List.sequence(0, n.subtract(1)).map(lambda m: start.advance(m, 'month'))
 
 # =====================
-# EXPORTA E LÊ CACHE DISCO
+# EXPORTA E LÊ CACHE DISCO (preguiçoso)
 # =====================
 def _paths_for(pivo_id: int):
     pid = int(pivo_id)
@@ -105,7 +119,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
     dates = monthly_dates(start_date)
 
-    # NDVI
+    # NDVI mensal
     def monthly_ndvi(date):
         start = ee.Date(date)
         end = start.advance(1, "month")
@@ -116,7 +130,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             ndvi = filtered.mean().focal_mean(3, "square", "pixels")
             return ndvi.clip(area).set({"system:time_start": start.millis()})
         return ee.Image(ee.Algorithms.If(filtered.size().eq(0), empty_case(), non_empty_case()))
-
     ndvi_coll = ee.ImageCollection(dates.map(monthly_ndvi))
 
     def ndvi_extract(image):
@@ -127,7 +140,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             'date': ee.Date(image.get('system:time_start')).format('YYYY-MM'),
             'ndvi': ee.Algorithms.If(ee.Algorithms.IsEqual(mean, None), 0, mean)
         })
-
     ndvi_fc = ndvi_coll.map(ndvi_extract)
     ndvi_feats = ndvi_fc.toList(ndvi_fc.size()).getInfo()
     df_ndvi = pd.DataFrame([f['properties'] for f in ndvi_feats])
@@ -136,7 +148,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         df_ndvi['ndvi'] = pd.to_numeric(df_ndvi['ndvi'], errors='coerce')
         df_ndvi = df_ndvi.dropna(subset=['ndvi']).sort_values('date')
 
-    # Precip
+    # Precip mensal (mm)
     def month_prec(date):
         start = ee.Date(date)
         end = start.advance(1, 'month')
@@ -149,7 +161,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             'date': start.format('YYYY-MM'),
             'precip_mm': ee.Algorithms.If(ee.Algorithms.IsEqual(mean_mm, None), 0, mean_mm)
         })
-
     prec_fc = ee.FeatureCollection(dates.map(month_prec))
     prec_feats = prec_fc.toList(prec_fc.size()).getInfo()
     df_prec = pd.DataFrame([f['properties'] for f in prec_feats])
@@ -161,31 +172,33 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
     # Merge & gravação
     df = pd.merge(df_ndvi, df_prec, on='date', how='left') if not df_ndvi.empty else pd.DataFrame(columns=['date','ndvi','precip_mm'])
     ndvi_path, prec_path, merged_path = _paths_for(pivo_id)
-    df_ndvi.to_parquet(ndvi_path, index=False)
-    df_prec.to_parquet(prec_path, index=False)
-    df.to_parquet(merged_path, index=False)
+    try:
+        df_ndvi.to_parquet(ndvi_path, index=False)
+        df_prec.to_parquet(prec_path, index=False)
+        df.to_parquet(merged_path, index=False)
+    except Exception as e:
+        st.error("Erro ao salvar cache Parquet. Verifique se `pyarrow` está instalado no ambiente.")
+        st.exception(e)
+        # fallback opcional: salvar CSV para não quebrar
+        df_ndvi.to_csv(ndvi_path.replace(".parquet", ".csv"), index=False)
+        df_prec.to_csv(prec_path.replace(".parquet", ".csv"), index=False)
+        df.to_csv(merged_path.replace(".parquet", ".csv"), index=False)
     return merged_path
 
 @st.cache_data(show_spinner=False)
 def merged_from_cache(pivo_id: int) -> pd.DataFrame:
-    _, _, merged_path = _paths_for(pivo_id)
+    ndvi_path, prec_path, merged_path = _paths_for(pivo_id)
+    # gera sob demanda se não existir
     if not os.path.exists(merged_path):
         build_and_store_series_for_pivot(int(pivo_id))
-    return pd.read_parquet(merged_path)
-
-@st.cache_data(show_spinner=True)
-def warm_cache_for_all_pivots(ids) -> int:
-    created = 0
-    for pid in ids:
-        _, _, merged_path = _paths_for(pid)
-        if not os.path.exists(merged_path):
-            build_and_store_series_for_pivot(int(pid))
-            created += 1
-    return created
-
-if len(os.listdir(MERGED_CACHE)) == 0:
-    with st.spinner("Pré-gerando cache local para todos os pivôs (primeira execução pode demorar)..."):
-        _ = warm_cache_for_all_pivots(pivo_ids)
+    try:
+        return pd.read_parquet(merged_path)
+    except Exception:
+        # fallback se estiver em CSV (caso pyarrow não disponível na implantação)
+        csv_path = merged_path.replace(".parquet", ".csv")
+        if os.path.exists(csv_path):
+            return pd.read_csv(csv_path, parse_dates=['date'])
+        raise
 
 # =====================
 # MAP HELPERS (OTIMIZAÇÃO)
@@ -198,19 +211,17 @@ def get_ndvi_mapid_for(pivo_id: int, last_date: str):
         .mean()
         .clip(area)
     )
-    vis = {'min': 0, 'max': 1, 'palette': ['red', 'yellow', 'green']}
+    vis = {'min': 0, 'max': 1, 'palette': ['#ff0000', '#ffff00', '#00a000']}
     return ndvi_image.getMapId(vis)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_all_pivots_outline_mapid():
-    # Contorno de todos os pivôs como tile (leve)
-    edges = ee.Image().paint(PIVOS_AREA, 1, 2)
-    vis = {'min': 0, 'max': 1, 'palette': ['000000']}
+    edges = ee.Image().paint(PIVOS_AREA, 1, 2)  # 2 px
+    vis = {'min': 0, 'max': 1, 'palette': ['#000000']}
     return edges.getMapId(vis)
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def get_all_centroids_list():
-    # Lista [lat, lon, id_ref] para cluster + marcadores numerados
     fc = PIVOS_PT.select(['id_ref']).map(
         lambda f: ee.Feature(ee.Geometry(f.geometry()).centroid(), {'id_ref': f.get('id_ref')})
     )
@@ -249,16 +260,22 @@ st.sidebar.caption("Linha verde contínua. Trechos NDVI ≤ limiar: linha e pont
 # FLUXO PRINCIPAL
 # =====================
 if selected_pivo:
+    # 1) Séries
     with st.spinner("🔄 Lendo séries (NDVI + Precipitação) do cache local..."):
-        df = merged_from_cache(int(selected_pivo))
+        try:
+            df = merged_from_cache(int(selected_pivo))
+        except Exception as e:
+            st.error("Erro ao carregar o cache de séries.")
+            st.exception(e)
+            df = pd.DataFrame(columns=['date','ndvi','precip_mm'])
+
         if not df.empty:
             df['date'] = pd.to_datetime(df['date'])
             df['ndvi'] = pd.to_numeric(df['ndvi'], errors='coerce')
             df['precip_mm'] = pd.to_numeric(df.get('precip_mm', 0.0), errors='coerce').fillna(0.0)
             df = df.dropna(subset=['ndvi']).sort_values('date')
-        else:
-            df = pd.DataFrame(columns=['date','ndvi','precip_mm'])
 
+    # 2) Cards resumo
     st.subheader(f"Resumo do pivô {selected_pivo}")
     col1, col2, col3 = st.columns(3)
     if df.empty:
@@ -278,83 +295,115 @@ if selected_pivo:
 
     st.divider()
 
-    # ===== MAPA (todos os pivôs + selecionado) =====
+    # 3) Mapa (todos os pivôs + selecionado)
     last_date_pd = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now()))
     last_date = last_date_pd.strftime('%Y-%m-%d')
 
     m = folium.Map(prefer_canvas=True)
 
-    # Enquadrar no selecionado (rápido)
-    area_fc = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first()
-    area_geom = area_fc.geometry()
-    bounds = ee.Geometry(area_geom).bounds().coordinates().getInfo()[0]
-    minx = min(c[0] for c in bounds); maxx = max(c[0] for c in bounds)
-    miny = min(c[1] for c in bounds); maxy = max(c[1] for c in bounds)
-    m.fit_bounds([[miny, minx], [maxy, maxx]])
+    # Enquadrar no selecionado
+    try:
+        area_fc = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first()
+        area_geom = area_fc.geometry()
+        bounds = ee.Geometry(area_geom).bounds().coordinates().getInfo()[0]
+        minx = min(c[0] for c in bounds); maxx = max(c[0] for c in bounds)
+        miny = min(c[1] for c in bounds); maxy = max(c[1] for c in bounds)
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
+    except Exception as e:
+        st.warning("Não foi possível obter o enquadramento do pivô selecionado.")
+        st.exception(e)
 
-    # 1) Contorno de TODOS os pivôs (tile)
-    all_outlines_mapid = get_all_pivots_outline_mapid()
-    folium.TileLayer(
-        tiles=all_outlines_mapid['tile_fetcher'].url_format,
-        attr='Pivôs (outline EE tile)',
-        name='Pivôs (outline)',
-        overlay=True,
-        control=False
-    ).add_to(m)
-
-    # 2) NDVI do mês atual (tile)
-    ndvi_mapid = get_ndvi_mapid_for(int(selected_pivo), last_date)
-    folium.TileLayer(
-        tiles=ndvi_mapid['tile_fetcher'].url_format,
-        attr='GEE NDVI',
-        name='NDVI',
-        overlay=True,
-        control=False
-    ).add_to(m)
-
-    # 3) MARCADORES NUMERADOS (MarkerCluster + BeautifyIcon)
-    all_centroids = get_all_centroids_list()
-    if all_centroids:
-        label_cluster = MarkerCluster(
-            name="Pivôs",
-            disableClusteringAtZoom=16,
-            showCoverageOnHover=False,
-            spiderfyOnMaxZoom=True,
-            zoomToBoundsOnClick=True,
-            chunkedLoading=True,
-            maxClusterRadius=60
+    # Contorno de todos os pivôs (tile)
+    try:
+        all_outlines_mapid = get_all_pivots_outline_mapid()
+        folium.TileLayer(
+            tiles=all_outlines_mapid['tile_fetcher'].url_format,
+            attr='Pivôs (outline EE tile)',
+            name='Pivôs (outline)',
+            overlay=True,
+            control=False
         ).add_to(m)
+    except Exception as e:
+        st.warning("Falha ao renderizar o tile de contorno dos pivôs.")
+        st.exception(e)
 
-        for lat, lon, pid in all_centroids:
-            icon = BeautifyIcon(
-                number=str(pid),
-                inner_icon_style='margin-top:0;',
-                border_color='#1f2937',
-                text_color='#111827',
-                background_color='#ffffff',
-                spin=False,
-                icon_shape='circle',
-                border_width=2
-            )
-            folium.Marker(location=[lat, lon], icon=icon).add_to(label_cluster)
-
-    # 4) Polígono do pivô selecionado com detalhe (simplificação mínima)
-    sel_geojson = get_selected_area_geojson(int(selected_pivo), simplify_m=2.0)
-    if sel_geojson and sel_geojson.get('features'):
-        folium.GeoJson(
-            sel_geojson,
-            name='Área do Pivô (selecionado)',
-            style_function=lambda x: {'color': '#2563eb', 'weight': 3, 'fillOpacity': 0}
+    # NDVI do mês atual (tile)
+    try:
+        ndvi_mapid = get_ndvi_mapid_for(int(selected_pivo), last_date)
+        folium.TileLayer(
+            tiles=ndvi_mapid['tile_fetcher'].url_format,
+            attr='GEE NDVI',
+            name='NDVI',
+            overlay=True,
+            control=False
         ).add_to(m)
+    except Exception as e:
+        st.warning("Falha ao renderizar o tile de NDVI.")
+        st.exception(e)
+
+    # Marcadores numerados (ou fallback DivIcon)
+    try:
+        all_centroids = get_all_centroids_list()
+        if all_centroids:
+            label_cluster = MarkerCluster(
+                name="Pivôs",
+                disableClusteringAtZoom=16,
+                showCoverageOnHover=False,
+                spiderfyOnMaxZoom=True,
+                zoomToBoundsOnClick=True,
+                chunkedLoading=True,
+                maxClusterRadius=60
+            ).add_to(m)
+
+            for lat, lon, pid in all_centroids:
+                if HAS_BEAUTIFY:
+                    icon = BeautifyIcon(
+                        number=str(pid),
+                        inner_icon_style='margin-top:0;',
+                        border_color='#1f2937',
+                        text_color='#111827',
+                        background_color='#ffffff',
+                        spin=False,
+                        icon_shape='circle',
+                        border_width=2
+                    )
+                    folium.Marker(location=[lat, lon], icon=icon).add_to(label_cluster)
+                else:
+                    folium.Marker(
+                        location=[lat, lon],
+                        icon=folium.DivIcon(
+                            html=f"""
+                                <div style="
+                                    font-size:16px;
+                                    font-weight:bold;
+                                    color:black;
+                                    text-shadow:
+                                        -2px -2px 0 white,
+                                        2px -2px 0 white,
+                                        -2px 2px 0 white,
+                                        2px 2px 0 white,
+                                        0px -2px 0 white,
+                                        0px 2px 0 white,
+                                        -2px 0px 0 white,
+                                        2px 0px 0 white;
+                                ">{pid}</div>
+                            """,
+                            icon_size=(0, 0),
+                            icon_anchor=(0, 0),
+                            class_name="pivot-label"
+                        )
+                    ).add_to(label_cluster)
+    except Exception as e:
+        st.warning("Falha ao renderizar os marcadores/labels.")
+        st.exception(e)
 
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
-        st.caption("Contornos de todos os pivôs (tile), marcadores numerados clusterizados e polígono detalhado do pivô selecionado.")
+        st.caption("Contornos de todos os pivôs (tile), marcadores numerados (ou labels) e polígono detalhado do pivô selecionado.")
 
-    # ===== GRÁFICO =====
+    # 4) Gráfico — eixo NDVI fixo [0.2, 1]
     if not df.empty:
-        # eixo NDVI fixo 0.2 → 1.0
         ndvi_scale = alt.Scale(domain=[0.2, 1])
 
         bars_precip = alt.Chart(df).mark_bar(color='#3b82f6', opacity=0.5).encode(
@@ -369,7 +418,6 @@ if selected_pivo:
                     axis=alt.Axis(format=".3f", orient='right', titleColor='green'))
         )
 
-        # segmentos/pontos abaixo do limiar
         def segments_below_threshold(local_df: pd.DataFrame, thr: float) -> pd.DataFrame:
             if local_df.empty:
                 return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
@@ -437,7 +485,7 @@ if selected_pivo:
         with tab2:
             st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
 
-    # ===== EXPORT CSV =====
+    # 5) Export CSV
     if not df.empty:
         csv = df[['date','ndvi','precip_mm']].copy()
         csv['date'] = csv['date'].dt.strftime('%Y-%m')

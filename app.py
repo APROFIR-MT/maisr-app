@@ -1,8 +1,10 @@
 import os
 import datetime
 import base64
+import urllib.parse
+
 import streamlit as st
-from google.oauth2 import service_account  # opcional; não precisa usar diretamente
+from google.oauth2 import service_account  # opcional (se precisar ler secrets fora)
 import ee
 import pandas as pd
 import altair as alt
@@ -10,13 +12,7 @@ import folium
 import geemap
 from streamlit_folium import st_folium
 from folium.plugins import MarkerCluster
-
-# ====== Tentativa de importar BeautifyIcon com fallback ======
-try:
-    from folium.plugins import BeautifyIcon
-    HAS_BEAUTIFY = True
-except Exception:
-    HAS_BEAUTIFY = False
+from folium.features import CustomIcon
 
 # =====================
 # CONFIG DA PÁGINA
@@ -46,16 +42,13 @@ for p in (CACHE_DIR, NDVI_CACHE, PREC_CACHE, MERGED_CACHE):
 @st.cache_resource(show_spinner=False)
 def init_ee_from_secrets():
     try:
-        service_account_info = st.secrets["earthengine"]
-        # Se a chave veio com "\n" literais, converte; se já tem quebras reais, não afeta.
-        key_data = service_account_info["private_key"].replace("\\n", "\n")
-        credentials = ee.ServiceAccountCredentials(
-            service_account_info["client_email"], key_data=key_data
-        )
+        sa_info = st.secrets["earthengine"]
+        key_data = sa_info["private_key"].replace("\\n", "\n")  # normaliza quebras de linha
+        credentials = ee.ServiceAccountCredentials(sa_info["client_email"], key_data=key_data)
         ee.Initialize(credentials)
         return True
     except Exception as e:
-        st.error("Falha ao inicializar o Earth Engine. Verifique `st.secrets['earthengine']`.")
+        st.error("Falha ao inicializar o Earth Engine. Verifique st.secrets['earthengine'].")
         st.exception(e)
         return False
 
@@ -70,7 +63,7 @@ with st.spinner("Inicializando Earth Engine..."):
 def get_user_collections():
     return (
         ee.FeatureCollection("users/lucaseducarvalho/PIVOS_PT"),
-        ee.FeatureCollection("users/lucaseducarvalho/PIVOS_AREA")
+        ee.FeatureCollection("users/lucaseducarvalho/PIVOS_AREA"),
     )
 
 PIVOS_PT, PIVOS_AREA = get_user_collections()
@@ -80,6 +73,10 @@ def get_pivo_ids_sorted():
     return PIVOS_PT.sort('id_ref').aggregate_array('id_ref').getInfo()
 
 pivo_ids = get_pivo_ids_sorted()
+
+# preserva seleção do pivô ao trocar de abas (evita “reset” por rerun)
+if "selected_pivo" not in st.session_state:
+    st.session_state["selected_pivo"] = pivo_ids[0] if pivo_ids else None
 
 @st.cache_resource(show_spinner=False)
 def get_base_collections():
@@ -177,9 +174,9 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         df_prec.to_parquet(prec_path, index=False)
         df.to_parquet(merged_path, index=False)
     except Exception as e:
-        st.error("Erro ao salvar cache Parquet. Verifique se `pyarrow` está instalado no ambiente.")
+        st.error("Erro ao salvar cache Parquet. Confirme se `pyarrow` está no ambiente.")
         st.exception(e)
-        # fallback opcional: salvar CSV para não quebrar
+        # fallback: CSV (evita quebrar o app)
         df_ndvi.to_csv(ndvi_path.replace(".parquet", ".csv"), index=False)
         df_prec.to_csv(prec_path.replace(".parquet", ".csv"), index=False)
         df.to_csv(merged_path.replace(".parquet", ".csv"), index=False)
@@ -187,14 +184,13 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
 
 @st.cache_data(show_spinner=False)
 def merged_from_cache(pivo_id: int) -> pd.DataFrame:
-    ndvi_path, prec_path, merged_path = _paths_for(pivo_id)
-    # gera sob demanda se não existir
+    _, _, merged_path = _paths_for(pivo_id)
     if not os.path.exists(merged_path):
         build_and_store_series_for_pivot(int(pivo_id))
+    # tenta Parquet, cai para CSV se necessário
     try:
         return pd.read_parquet(merged_path)
     except Exception:
-        # fallback se estiver em CSV (caso pyarrow não disponível na implantação)
         csv_path = merged_path.replace(".parquet", ".csv")
         if os.path.exists(csv_path):
             return pd.read_csv(csv_path, parse_dates=['date'])
@@ -203,6 +199,18 @@ def merged_from_cache(pivo_id: int) -> pd.DataFrame:
 # =====================
 # MAP HELPERS (OTIMIZAÇÃO)
 # =====================
+def svg_number_icon_data_uri(number: int, size: int = 26) -> str:
+    """Gera um ícone SVG leve com o número centralizado (Data URI)."""
+    r = size // 2
+    font_size = int(size * 0.55)
+    svg = f'''
+<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">
+  <circle cx="{r}" cy="{r}" r="{r-1}" fill="#ffffff" stroke="#1f2937" stroke-width="2"/>
+  <text x="50%" y="52%" font-family="Arial, Helvetica, sans-serif" font-size="{font_size}" font-weight="700"
+        text-anchor="middle" dominant-baseline="middle" fill="#111827">{number}</text>
+</svg>'''.strip()
+    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_ndvi_mapid_for(pivo_id: int, last_date: str):
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
@@ -216,12 +224,13 @@ def get_ndvi_mapid_for(pivo_id: int, last_date: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_all_pivots_outline_mapid():
-    edges = ee.Image().paint(PIVOS_AREA, 1, 2)  # 2 px
+    edges = ee.Image().paint(PIVOS_AREA, 1, 2)  # 2 px de largura
     vis = {'min': 0, 'max': 1, 'palette': ['#000000']}
     return edges.getMapId(vis)
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def get_all_centroids_list():
+    # retorna [lat, lon, id_ref]
     fc = PIVOS_PT.select(['id_ref']).map(
         lambda f: ee.Feature(ee.Geometry(f.geometry()).centroid(), {'id_ref': f.get('id_ref')})
     )
@@ -230,7 +239,7 @@ def get_all_centroids_list():
     for f in features:
         c = f['geometry']['coordinates']
         pid = f['properties'].get('id_ref')
-        coords.append([c[1], c[0], pid])  # [lat, lon, id]
+        coords.append([c[1], c[0], pid])
     return coords
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
@@ -249,17 +258,28 @@ def get_selected_area_geojson(pivo_id: int, simplify_m: float = 2.0):
     return {'type': 'FeatureCollection', 'features': feats}
 
 # =====================
-# SIDEBAR
+# SIDEBAR (usa session_state para não “resetar”)
 # =====================
 st.sidebar.markdown("### Parâmetros")
-selected_pivo = st.sidebar.selectbox("🧩 Selecione o Pivô", options=pivo_ids)
+# define index a partir do que já está na sessão
+if st.session_state["selected_pivo"] in pivo_ids:
+    default_index = pivo_ids.index(st.session_state["selected_pivo"])
+else:
+    default_index = 0
+
+selected_pivo = st.sidebar.selectbox(
+    "🧩 Selecione o Pivô",
+    options=pivo_ids,
+    index=default_index,
+    key="selected_pivo",
+)
 threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
 st.sidebar.caption("Linha verde contínua. Trechos NDVI ≤ limiar: linha e pontos vermelhos. Barras: precipitação mensal (mm).")
 
 # =====================
 # FLUXO PRINCIPAL
 # =====================
-if selected_pivo:
+if selected_pivo is not None:
     # 1) Séries
     with st.spinner("🔄 Lendo séries (NDVI + Precipitação) do cache local..."):
         try:
@@ -310,7 +330,7 @@ if selected_pivo:
         miny = min(c[1] for c in bounds); maxy = max(c[1] for c in bounds)
         m.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
-        st.warning("Não foi possível obter o enquadramento do pivô selecionado.")
+        st.warning("Não foi possível ajustar o enquadramento do pivô selecionado.")
         st.exception(e)
 
     # Contorno de todos os pivôs (tile)
@@ -341,7 +361,7 @@ if selected_pivo:
         st.warning("Falha ao renderizar o tile de NDVI.")
         st.exception(e)
 
-    # Marcadores numerados (ou fallback DivIcon)
+    # Pinos numerados super leves (SVG em data URI)
     try:
         all_centroids = get_all_centroids_list()
         if all_centroids:
@@ -352,55 +372,25 @@ if selected_pivo:
                 spiderfyOnMaxZoom=True,
                 zoomToBoundsOnClick=True,
                 chunkedLoading=True,
-                maxClusterRadius=60
+                maxClusterRadius=60,
             ).add_to(m)
 
+            icon_cache = {}
             for lat, lon, pid in all_centroids:
-                if HAS_BEAUTIFY:
-                    icon = BeautifyIcon(
-                        number=str(pid),
-                        inner_icon_style='margin-top:0;',
-                        border_color='#1f2937',
-                        text_color='#111827',
-                        background_color='#ffffff',
-                        spin=False,
-                        icon_shape='circle',
-                        border_width=2
-                    )
-                    folium.Marker(location=[lat, lon], icon=icon).add_to(label_cluster)
-                else:
-                    folium.Marker(
-                        location=[lat, lon],
-                        icon=folium.DivIcon(
-                            html=f"""
-                                <div style="
-                                    font-size:16px;
-                                    font-weight:bold;
-                                    color:black;
-                                    text-shadow:
-                                        -2px -2px 0 white,
-                                        2px -2px 0 white,
-                                        -2px 2px 0 white,
-                                        2px 2px 0 white,
-                                        0px -2px 0 white,
-                                        0px 2px 0 white,
-                                        -2px 0px 0 white,
-                                        2px 0px 0 white;
-                                ">{pid}</div>
-                            """,
-                            icon_size=(0, 0),
-                            icon_anchor=(0, 0),
-                            class_name="pivot-label"
-                        )
-                    ).add_to(label_cluster)
+                if pid not in icon_cache:
+                    data_uri = svg_number_icon_data_uri(int(pid), size=26)
+                    icon_cache[pid] = CustomIcon(icon_image=data_uri, icon_size=(26, 26), icon_anchor=(13, 13))
+                folium.Marker(location=[lat, lon], icon=icon_cache[pid]).add_to(label_cluster)
     except Exception as e:
-        st.warning("Falha ao renderizar os marcadores/labels.")
+        st.warning("Falha ao renderizar os pinos numerados.")
         st.exception(e)
 
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
-        st.caption("Contornos de todos os pivôs (tile), marcadores numerados (ou labels) e polígono detalhado do pivô selecionado.")
+        st.caption(
+            "Contornos de todos os pivôs (tile), pinos numerados ultraleves (SVG) e polígono detalhado do pivô selecionado."
+        )
 
     # 4) Gráfico — eixo NDVI fixo [0.2, 1]
     if not df.empty:
@@ -455,7 +445,8 @@ if selected_pivo:
                 else:
                     in_seg = False
                 prev = curr
-            if not seg_rows: return pd.DataFrame(columns=['date','ndvi','seg'])
+            if not seg_rows:
+                return pd.DataFrame(columns=['date','ndvi','seg'])
             return pd.DataFrame(seg_rows, columns=['date','ndvi','seg']).drop_duplicates().sort_values('date')
 
         df_below = segments_below_threshold(df[['date','ndvi']].copy(), threshold)
@@ -472,13 +463,20 @@ if selected_pivo:
             tooltip=[alt.Tooltip('date:T', title='Data'), alt.Tooltip('ndvi:Q', title='NDVI', format=".3f")]
         )
 
-        chart = alt.layer(bars_precip, line_green_full, line_red_overlay, points_green, points_red
-            ).resolve_scale(y='independent'
-            ).properties(
-                title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}',
-                width='container', height=360
-            ).configure_axis(grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12
-            ).configure_view(strokeWidth=0).configure_title(fontSize=14)
+        chart = alt.layer(
+            bars_precip, line_green_full, line_red_overlay, points_green, points_red
+        ).resolve_scale(
+            y='independent'
+        ).properties(
+            title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}',
+            width='container', height=360
+        ).configure_axis(
+            grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12
+        ).configure_view(
+            strokeWidth=0
+        ).configure_title(
+            fontSize=14
+        )
         with tab2:
             st.altair_chart(chart, use_container_width=True)
     else:

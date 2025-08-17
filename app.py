@@ -11,78 +11,105 @@ import altair as alt
 import folium
 import geemap  # para ee_to_geojson
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster  # <<< clusters
+from folium.plugins import MarkerCluster
 
-
-# ---------- Configuração da página ----------
+# =====================
+# CONFIG DA PÁGINA
+# =====================
 st.set_page_config(layout="wide")
 st.markdown(
     "<h1 style='text-align:left; font-size:40px;'>🌾 Monitoramento NDVI MODIS + Precipitação (ERA5-Land)</h1>",
     unsafe_allow_html=True
 )
 
-# (Opcional) Logo no painel lateral
 if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
+# =====================
+# AUTENTICAÇÃO / EE INIT (CACHE)
+# =====================
+@st.cache_resource(show_spinner=False)
+def init_ee_from_secrets():
+    service_account_info = st.secrets["earthengine"]
+    key_data = service_account_info["private_key"].replace('\\n', '\n')
+    credentials = ee.ServiceAccountCredentials(
+        service_account_info["client_email"], key_data=key_data
+    )
+    ee.Initialize(credentials)
+    return True
 
-# ---------- Autenticação Earth Engine ----------
-# Carrega credenciais do secrets
-service_account_info = st.secrets["earthengine"]
+with st.spinner("Inicializando Earth Engine..."):
+    init_ee_from_secrets()
 
-# Inicializa o Earth Engine
-credentials = ee.ServiceAccountCredentials(
-    service_account_info["client_email"],
-    key_data=service_account_info["private_key"]
-)
-ee.Initialize(credentials)
+# =====================
+# COLEÇÕES DO USUÁRIO (CACHE)
+# =====================
+@st.cache_resource(show_spinner=False)
+def get_user_collections():
+    PIVOS_PT = ee.FeatureCollection("users/lucaseducarvalho/PIVOS_PT")
+    PIVOS_AREA = ee.FeatureCollection("users/lucaseducarvalho/PIVOS_AREA")
+    return PIVOS_PT, PIVOS_AREA
 
+PIVOS_PT, PIVOS_AREA = get_user_collections()
 
-# ---------- Camadas do usuário ----------
-PIVOS_PT = ee.FeatureCollection("users/lucaseducarvalho/PIVOS_PT")
-PIVOS_AREA = ee.FeatureCollection("users/lucaseducarvalho/PIVOS_AREA")
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def get_pivo_ids_sorted():
+    return PIVOS_PT.sort('id_ref').aggregate_array('id_ref').getInfo()
 
+pivo_ids = get_pivo_ids_sorted()
 
-# ---------- Coleções / Dados ----------
-# NDVI (MODIS 16d -> composições mensais)
-modis = (
-    ee.ImageCollection('MODIS/061/MOD13Q1')
-    .filterDate('2021-01-01', ee.Date(datetime.datetime.now()))
-    .select('NDVI')
-    .map(lambda img: img.multiply(0.0001).copyProperties(img, ['system:time_start']))
-)
+# =====================
+# DADOS BASE (CACHE DE COLEÇÃO)
+# =====================
+@st.cache_resource(show_spinner=False)
+def get_base_collections():
+    # NDVI (MODIS) em escala 0.0001
+    modis = (
+        ee.ImageCollection('MODIS/061/MOD13Q1')
+        .select('NDVI')
+        .map(lambda img: img.multiply(0.0001).copyProperties(img, ['system:time_start']))
+    )
+    era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY').select('total_precipitation')
+    return modis, era5
 
-# ERA5-Land hourly precip (m) -> somaremos por mês e converteremos para mm
-era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY').select('total_precipitation')
+modis, era5 = get_base_collections()
 
+# =====================
+# UTILIDADES (CACHEADAS)
+# =====================
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def ee_to_valid_geojson_cached(fc_path: str):
+    """Carrega FC por caminho e converte para GeoJSON válido (removendo features sem geometria)."""
+    fc = ee.FeatureCollection(fc_path)
+    raw = geemap.ee_to_geojson(fc)
+    valid_features = []
+    for f in raw.get('features', []):
+        geom = f.get('geometry')
+        if geom and isinstance(geom, dict) and geom.get('coordinates'):
+            valid_features.append(f)
+    return {'type': 'FeatureCollection', 'features': valid_features}
 
-# ---------- Utilidades ----------
-def ee_to_valid_geojson(fc):
-    """Converte FeatureCollection em GeoJSON válido (removendo features sem geometria)."""
-    try:
-        raw = geemap.ee_to_geojson(fc)
-        valid_features = []
-        for f in raw.get('features', []):
-            geom = f.get('geometry')
-            if geom and isinstance(geom, dict) and geom.get('coordinates'):
-                valid_features.append(f)
-        return {'type': 'FeatureCollection', 'features': valid_features}
-    except Exception as e:
-        st.error(f"Erro ao converter FeatureCollection: {e}")
-        return {'type': 'FeatureCollection', 'features': []}
-
-
-def monthly_dates(start_date_str='2021-01-01'):
-    start_date = ee.Date(start_date_str)
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def monthly_dates_range(start_date_str: str, end_date_str: str, include_current: bool):
+    """Lista de datas mensais [start, end). Se include_current=True, inclui mês corrente até hoje; senão, até último mês completo."""
+    start = ee.Date(start_date_str)
     today = ee.Date(datetime.datetime.now())
-    months = ee.List.sequence(0, today.difference(start_date, 'month').round().subtract(1))
-    dates = months.map(lambda m: start_date.advance(m, 'month'))
-    return dates
+    if include_current:
+        last_month_anchor = ee.Date.fromYMD(today.get('year'), today.get('month'), 1)
+    else:
+        last_month_anchor = ee.Date.fromYMD(today.get('year'), today.get('month'), 1).advance(-1, 'month')
 
+    end = ee.Date(end_date_str) if end_date_str else last_month_anchor
+    n = end.difference(start, 'month')
+    return ee.List.sequence(0, n.subtract(1)).map(lambda m: start.advance(m, 'month'))
 
-def compute_ndvi_series(pivo_id):
+# =====================
+# CÁLCULO DE SÉRIES (CACHE)
+# =====================
+@st.cache_data(ttl=24*3600, show_spinner=True)
+def compute_ndvi_series_cached(pivo_id: int, start_date: str, end_date: str, scale_ndvi: int, include_current: bool):
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
-    dates = monthly_dates()
+    dates = monthly_dates_range(start_date, end_date, include_current)
 
     def monthly_composite(date):
         start = ee.Date(date)
@@ -110,7 +137,7 @@ def compute_ndvi_series(pivo_id):
         mean = image.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=area,
-            scale=250,
+            scale=scale_ndvi,
             bestEffort=True,
             maxPixels=1e13
         ).get('NDVI')
@@ -119,22 +146,19 @@ def compute_ndvi_series(pivo_id):
             'ndvi': ee.Algorithms.If(ee.Algorithms.IsEqual(mean, None), 0, mean)
         })
 
-    series = monthly_collection.map(extract).toList(monthly_collection.size())
-    features = series.getInfo()
-    df = pd.DataFrame([f['properties'] for f in features])
+    series = monthly_collection.map(extract)
+    feats = series.toList(series.size()).getInfo()
+    df = pd.DataFrame([f['properties'] for f in feats])
     if not df.empty:
         df['date'] = pd.to_datetime(df['date'])
         df['ndvi'] = pd.to_numeric(df['ndvi'], errors='coerce')
         df = df.dropna(subset=['ndvi']).sort_values('date')
     return df
 
-
-def compute_precip_series(pivo_id):
-    """ Precipitação acumulada mensal (mm/mês) da ERA5-Land (hourly total_precipitation em metros).
-        Soma mensal (m) -> mm (x1000). Redução espacial = média sobre a área do pivô.
-    """
+@st.cache_data(ttl=24*3600, show_spinner=True)
+def compute_precip_series_cached(pivo_id: int, start_date: str, end_date: str, scale_era5: int, include_current: bool):
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
-    dates = monthly_dates()
+    dates = monthly_dates_range(start_date, end_date, include_current)
 
     def month_feature(date):
         start = ee.Date(date)
@@ -144,7 +168,7 @@ def compute_precip_series(pivo_id):
         mean_mm = monthly_sum_mm.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=area,
-            scale=9000,  # resolução bruta ERA5-Land
+            scale=scale_era5,  # resolução efetiva
             bestEffort=True,
             maxPixels=1e13
         ).get('precip_mm')
@@ -162,12 +186,12 @@ def compute_precip_series(pivo_id):
         df = df.sort_values('date')
     return df
 
+# =====================
+# AUXILIAR: SEGMENTOS <= LIMIAR
+# =====================
+import numpy as np
 
-# ---------- Helper: segmentos ≤ limiar com IDs para não conectar entre si ----------
 def segments_below_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    """ Retorna apenas os trechos onde ndvi <= threshold (com pontos de cruzamento),
-        e atribui ID 'seg' para o Altair NÃO conectar segmentos distintos (detail='seg:N').
-    """
     if df.empty:
         return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
     df = df.sort_values('date').reset_index(drop=True)
@@ -224,22 +248,41 @@ def segments_below_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame
         return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
     return pd.DataFrame(seg_rows, columns=['date', 'ndvi', 'seg']).drop_duplicates().sort_values('date')
 
-
-# ---------- Sidebar ----------
-pivo_ids = PIVOS_PT.aggregate_array('id_ref').sort().getInfo()
+# =====================
+# SIDEBAR — PARÂMETROS DE PERFORMANCE
+# =====================
 st.sidebar.markdown("### Parâmetros")
 selected_pivo = st.sidebar.selectbox("🧩 Selecione o Pivô", options=pivo_ids)
+
+# Período — por padrão, últimos 24 meses
+today = datetime.date.today()
+default_start = (today.replace(day=1) - datetime.timedelta(days=730)).replace(day=1)
+start_date = st.sidebar.date_input("Início (YYYY-MM-DD)", value=default_start)
+end_date = st.sidebar.date_input("Fim (YYYY-MM-DD)", value=today)
+include_current = st.sidebar.checkbox("Incluir mês corrente", value=False)
+
+# Modo rápido: usa escalas mais grossas nas reduções (↑velocidade)
+fast_mode = st.sidebar.toggle("⚡️ Modo rápido (mais rápido, menos preciso)", value=True, help="Usa escala 500–1000 m nas reduções espaciais.")
+
+# Limiar NDVI
 threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
 st.sidebar.caption("Linha verde contínua. Trechos NDVI ≤ limiar: linha e pontos vermelhos. Barras: precipitação mensal (mm).")
 
+# Escalas das reduções
+scale_ndvi = 500 if fast_mode else 250
+scale_era5 = 9000  # ERA5-Land ~9km (não muda no fast_mode)
 
-# ---------- Fluxo principal ----------
+# =====================
+# FLUXO PRINCIPAL
+# =====================
 if selected_pivo:
-
-    # 1) Dados NDVI + Precip
-    with st.spinner("🔄 Carregando séries (NDVI + Precipitação)..."):
-        df_ndvi = compute_ndvi_series(selected_pivo)
-        df_prec = compute_precip_series(selected_pivo)
+    with st.spinner("🔄 Carregando séries (NDVI + Precipitação) com cache..."):
+        df_ndvi = compute_ndvi_series_cached(
+            int(selected_pivo), start_date.isoformat(), end_date.isoformat(), scale_ndvi, include_current
+        )
+        df_prec = compute_precip_series_cached(
+            int(selected_pivo), start_date.isoformat(), end_date.isoformat(), scale_era5, include_current
+        )
         if df_ndvi is None or df_ndvi.empty:
             df = pd.DataFrame(columns=['date', 'ndvi', 'precip_mm'])
         else:
@@ -248,7 +291,7 @@ if selected_pivo:
             df['precip_mm'] = pd.to_numeric(df.get('precip_mm', 0.0), errors='coerce').fillna(0.0)
             df = df.dropna(subset=['ndvi']).sort_values('date')
 
-    # 2) Cards de resumo (métricas)
+    # 2) Cards de resumo
     st.subheader(f"Resumo do pivô {selected_pivo}")
     col1, col2, col3 = st.columns(3)
     if df.empty:
@@ -268,24 +311,24 @@ if selected_pivo:
 
     st.divider()
 
-    # 3) MAPA
-    pivo_geom = (
-        PIVOS_PT.filter(ee.Filter.eq('id_ref', int(selected_pivo)))
-        .first()
-        .geometry()
-        .centroid()
-        .coordinates()
-        .getInfo()
-    )
-    lat_center, lon_center = pivo_geom[1], pivo_geom[0]
-    m = folium.Map(location=[lat_center, lon_center], zoom_start=15)
+    # 3) MAPA (ajuste: clip no pivô)
+    area_fc = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first()
+    area_geom = area_fc.geometry()
 
-    # NDVI do mês mais recente (para visualização no mapa)
-    last_date = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now())).strftime('%Y-%m-%d')
+    # bounds para fit
+    bounds = ee.Geometry(area_geom).bounds().coordinates().getInfo()[0]
+    minx = min(c[0] for c in bounds); maxx = max(c[0] for c in bounds)
+    miny = min(c[1] for c in bounds); maxy = max(c[1] for c in bounds)
+
+    m = folium.Map()
+    m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+    # NDVI do mês mais recente disponível
+    last_date_pd = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now()))
+    last_date = last_date_pd.strftime('%Y-%m-%d')
+
     ndvi_image = (
-        modis.filterDate(last_date, ee.Date(last_date).advance(1, 'month'))
-        .mean()
-        .clip(PIVOS_AREA)
+        modis.filterDate(last_date, ee.Date(last_date).advance(1, 'month')).mean().clip(area_geom)
     )
     mapid = ndvi_image.getMapId({'min': 0, 'max': 1, 'palette': ['red', 'yellow', 'green']})
     folium.TileLayer(
@@ -296,9 +339,9 @@ if selected_pivo:
         control=True
     ).add_to(m)
 
-    # Áreas (GeoJSON validado)
-    pivos_area_geojson = ee_to_valid_geojson(PIVOS_AREA)
-    pivos_pt_geojson = ee_to_valid_geojson(PIVOS_PT)
+    # GeoJSONs (cacheados)
+    pivos_area_geojson = ee_to_valid_geojson_cached("users/lucaseducarvalho/PIVOS_AREA")
+    pivos_pt_geojson = ee_to_valid_geojson_cached("users/lucaseducarvalho/PIVOS_PT")
 
     if pivos_area_geojson['features']:
         folium.GeoJson(
@@ -306,14 +349,12 @@ if selected_pivo:
             name='Área dos Pivôs',
             style_function=lambda x: {'color': 'blue', 'weight': 2, 'fillOpacity': 0}
         ).add_to(m)
-    else:
-        st.warning("⚠️ Nenhuma área de pivô encontrada.")
 
-    # ---- RÓTULOS COM CLUSTER (somente DivIcon; sem camada GeoJson de pontos) ----
-    if pivos_pt_geojson['features']:
+    # Rótulos com cluster (toggle via fast_mode para aliviar em coleções muito grandes)
+    if pivos_pt_geojson['features'] and (not fast_mode or len(pivos_pt_geojson['features']) <= 2000):
         label_cluster = MarkerCluster(
             name="Rótulos",
-            disableClusteringAtZoom=16,  # ↑ só “explode” próximo
+            disableClusteringAtZoom=16,
             showCoverageOnHover=False,
             spiderfyOnMaxZoom=True,
             zoomToBoundsOnClick=True,
@@ -324,7 +365,6 @@ if selected_pivo:
         for f in pivos_pt_geojson['features']:
             coords = f['geometry']['coordinates']
             label = str(f['properties'].get('id_ref', ''))
-            # DivIcon puro (sem imagem) para evitar ícone de “missing image”
             folium.Marker(
                 location=[coords[1], coords[0]],
                 icon=folium.DivIcon(
@@ -341,30 +381,31 @@ if selected_pivo:
                                 0px -2px 0 white,
                                 0px 2px 0 white,
                                 -2px 0px 0 white,
-                                2px 0px 0 white;
-                        ">{label}</div>
+                                2px 0px 0 white;">
+                            {label}
+                        </div>
                     """,
-                    icon_size=(0, 0),  # evita qualquer sprite padrão
+                    icon_size=(0, 0),
                     icon_anchor=(0, 0),
                     class_name="pivot-label"
                 )
             ).add_to(label_cluster)
-    else:
-        st.warning("⚠️ Nenhum ponto de pivô encontrado.")
 
     folium.LayerControl().add_to(m)
 
-    # 4) GRÁFICO COMBINADO — NDVI (linhas/pontos) + Precip (barras)
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
         st.caption("Legenda NDVI: vermelho (↓) → amarelo → verde (↑). Barras: precipitação mensal acumulada (ERA5-Land).")
 
+    # 4) GRÁFICO COMBINADO
     with tab2:
         if df.empty:
             st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
         else:
-            ndvi_scale = alt.Scale(domain=[0.2, 1])  # NDVI começa em 0.2
+            ndvi_min = max(threshold, float(df['ndvi'].min())) if not df.empty else 0.2
+            ndvi_max = float(df['ndvi'].max()) if not df.empty else 1.0
+            ndvi_scale = alt.Scale(domain=[ndvi_min, ndvi_max])
 
             bars_precip = alt.Chart(df).mark_bar(color='#3b82f6', opacity=0.5).encode(
                 x=alt.X('date:T', title='Data'),
@@ -427,10 +468,14 @@ if selected_pivo:
 
             st.altair_chart(chart, use_container_width=True)
 
-    # CSV com NDVI e precip juntos
+    # CSV download (PT-BR friendly)
     csv = df[['date', 'ndvi', 'precip_mm']].copy()
     csv['date'] = csv['date'].dt.strftime('%Y-%m')
-    csv_str = csv.to_csv(index=False)
+    csv_str = csv.to_csv(index=False, sep=';', decimal=',')
     b64 = base64.b64encode(csv_str.encode()).decode()
     href = f'<a href="data:text/csv;base64,{b64}" download="ndvi_precip_{selected_pivo}.csv">📥 Baixar dados (NDVI + Precip) CSV</a>'
     st.markdown(href, unsafe_allow_html=True)
+
+    # Aviso de zeros consecutivos
+    if not df.empty and (df['ndvi'] == 0).rolling(3).sum().max() >= 3:
+        st.info("ℹ️ Muitos meses com NDVI=0. Pode indicar ausência de cenas válidas no período/área.")

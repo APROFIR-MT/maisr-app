@@ -1,7 +1,6 @@
 import os
 import datetime
 import base64
-import urllib.parse
 from math import cos, radians
 
 import streamlit as st
@@ -12,10 +11,16 @@ import folium
 import geemap
 from streamlit_folium import st_folium
 from folium.plugins import MarkerCluster
-from folium.features import CustomIcon
+
+# ====== tenta usar BeautifyIcon; fallback para marcador padrão + tooltip ======
+try:
+    from folium.plugins import BeautifyIcon
+    HAS_BEAUTIFY = True
+except Exception:
+    HAS_BEAUTIFY = False
 
 # =====================
-# CONFIG DA PÁGINA
+# CONFIG
 # =====================
 st.set_page_config(layout="wide")
 st.markdown(
@@ -36,7 +41,7 @@ for p in (CACHE_DIR, NDVI_CACHE, PREC_CACHE, MERGED_CACHE):
     os.makedirs(p, exist_ok=True)
 
 # =====================
-# EARTH ENGINE
+# EE INIT
 # =====================
 @st.cache_resource(show_spinner=False)
 def init_ee():
@@ -62,7 +67,7 @@ def get_pivo_ids_sorted():
     return PIVOS_PT.sort('id_ref').aggregate_array('id_ref').getInfo()
 pivo_ids = get_pivo_ids_sorted()
 
-# Preserva seleção do pivô e estado do mapa
+# Estado estável
 if "selected_pivo" not in st.session_state:
     st.session_state["selected_pivo"] = pivo_ids[0] if pivo_ids else None
 if "map_bounds" not in st.session_state:
@@ -70,7 +75,7 @@ if "map_bounds" not in st.session_state:
 if "map_center" not in st.session_state:
     st.session_state["map_center"] = None
 if "map_zoom" not in st.session_state:
-    st.session_state["map_zoom"] = None
+    st.session_state["map_zoom"] = 14  # um zoom intermediário default
 
 @st.cache_resource(show_spinner=False)
 def get_base_collections():
@@ -84,7 +89,7 @@ def get_base_collections():
 modis, era5 = get_base_collections()
 
 # =====================
-# DATAS MENSAL
+# DATAS MENSAIS
 # =====================
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def monthly_dates(start_date_str='2021-01-01'):
@@ -110,7 +115,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
     dates = monthly_dates(start_date)
 
-    # NDVI
     def monthly_ndvi(date):
         start = ee.Date(date)
         end = start.advance(1, "month")
@@ -138,7 +142,6 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         df_ndvi['ndvi'] = pd.to_numeric(df_ndvi['ndvi'], errors='coerce')
         df_ndvi = df_ndvi.dropna(subset=['ndvi']).sort_values('date')
 
-    # Precip
     def month_prec(date):
         start = ee.Date(date)
         end = start.advance(1, 'month')
@@ -175,19 +178,6 @@ def merged_from_cache(pivo_id: int) -> pd.DataFrame:
 # =====================
 # MAP HELPERS
 # =====================
-def svg_number_icon_data_uri(number: int, size: int = 26) -> str:
-    """Ícone SVG leve com número central (uma linha, sem f-string multilinha)."""
-    r = size // 2
-    font_size = int(size * 0.55)
-    svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">'
-        '<circle cx="{r}" cy="{r}" r="{r2}" fill="#ffffff" stroke="#1f2937" stroke-width="2"/>'
-        '<text x="50%" y="52%" font-family="Arial, Helvetica, sans-serif" font-size="{fs}" font-weight="700" '
-        'text-anchor="middle" dominant-baseline="middle" fill="#111827">{num}</text>'
-        '</svg>'
-    ).format(s=size, r=r, r2=r-1, fs=font_size, num=number)
-    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_ndvi_mapid_for(pivo_id: int, last_date: str):
     area = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first().geometry()
@@ -197,7 +187,7 @@ def get_ndvi_mapid_for(pivo_id: int, last_date: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_all_pivots_outline_mapid():
-    edges = ee.Image().paint(PIVOS_AREA, 1, 2)
+    edges = ee.Image().paint(PIVOS_AREA, 1, 2)  # 2 px
     vis = {'min': 0, 'max': 1, 'palette': ['#000000']}
     return edges.getMapId(vis)
 
@@ -229,7 +219,7 @@ def get_selected_area_geojson(pivo_id: int, simplify_m: float = 2.0):
     return {'type': 'FeatureCollection', 'features': feats}
 
 # =====================
-# SIDEBAR (estado estável)
+# SIDEBAR (preserva seleção)
 # =====================
 st.sidebar.markdown("### Parâmetros")
 if st.session_state["selected_pivo"] in pivo_ids:
@@ -237,17 +227,24 @@ if st.session_state["selected_pivo"] in pivo_ids:
 else:
     default_index = 0
 
+def _on_select_change():
+    # limpeza leve do estado do mapa ao trocar pivô
+    st.session_state["map_bounds"] = None
+    st.session_state["map_center"] = None
+    st.session_state["map_zoom"] = 14
+
 selected_pivo = st.sidebar.selectbox(
     "🧩 Selecione o Pivô",
     options=pivo_ids,
     index=default_index,
     key="selected_pivo",
+    on_change=_on_select_change,
 )
 threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
 st.sidebar.caption("Linha verde contínua. Trechos NDVI ≤ limiar: linha e pontos vermelhos. Barras: precipitação mensal (mm).")
 
 # =====================
-# SÉRIES
+# SÉRIES (independem do mapa)
 # =====================
 with st.spinner("🔄 Lendo séries (NDVI + Precipitação) do cache local..."):
     df = merged_from_cache(int(selected_pivo)) if selected_pivo is not None else pd.DataFrame(columns=['date','ndvi','precip_mm'])
@@ -277,12 +274,14 @@ else:
 st.divider()
 
 # =====================
-# MAPA (2-pass: tiles -> captura bounds; depois pinos no viewport)
+# MAPA (sempre mostra pinos — cap por viewport; pivô selecionado sempre visível)
 # =====================
 last_date_pd = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now()))
 last_date = last_date_pd.strftime('%Y-%m-%d')
 
 m = folium.Map(prefer_canvas=True)
+
+# Enquadrar no selecionado
 try:
     area_fc = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first()
     area_geom = area_fc.geometry()
@@ -293,6 +292,7 @@ try:
 except Exception:
     pass
 
+# Tiles leves
 all_outlines_mapid = get_all_pivots_outline_mapid()
 folium.TileLayer(
     tiles=all_outlines_mapid['tile_fetcher'].url_format,
@@ -301,7 +301,6 @@ folium.TileLayer(
     overlay=True,
     control=False
 ).add_to(m)
-
 ndvi_mapid = get_ndvi_mapid_for(int(selected_pivo), last_date)
 folium.TileLayer(
     tiles=ndvi_mapid['tile_fetcher'].url_format,
@@ -321,6 +320,7 @@ if sel_geojson and sel_geojson.get('features'):
 
 tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
 
+# Render mapa e capturar estado
 with tab1:
     map_state = st_folium(m, use_container_width=True, height=520, returned_objects=["last_active_drawing"])
     if map_state and "bounds" in map_state and map_state["bounds"]:
@@ -330,74 +330,93 @@ with tab1:
     if map_state and "center" in map_state and map_state["center"]:
         st.session_state["map_center"] = (map_state["center"]["lat"], map_state["center"]["lng"])
 
+# Desenhar pinos (sempre mostra; cap adaptativo)
 bounds = st.session_state.get("map_bounds")
 zoom = st.session_state.get("map_zoom") or 0
 center = st.session_state.get("map_center")
 
-if bounds and zoom >= 12:
-    df_pts = get_all_centroids_df()
-    south, west = bounds["south"], bounds["west"]
-    north, east = bounds["north"], bounds["east"]
+# Recria um mapa para adicionar pinos e manter tiles
+m2 = folium.Map(prefer_canvas=True)
+try:
+    if bounds:
+        m2.fit_bounds([[bounds["south"], bounds["west"]], [bounds["north"], bounds["east"]]])
+    else:
+        m2.fit_bounds([[miny, minx], [maxy, maxx]])
+except Exception:
+    pass
 
-    vis = df_pts[(df_pts["lat"] >= south) & (df_pts["lat"] <= north) &
-                 (df_pts["lon"] >= west)  & (df_pts["lon"] <= east)]
+folium.TileLayer(tiles=all_outlines_mapid['tile_fetcher'].url_format, attr='Pivôs (outline EE tile)', overlay=True, control=False).add_to(m2)
+folium.TileLayer(tiles=ndvi_mapid['tile_fetcher'].url_format, attr='GEE NDVI', overlay=True, control=False).add_to(m2)
+if sel_geojson and sel_geojson.get('features'):
+    folium.GeoJson(sel_geojson, name='Área do Pivô (selecionado)', style_function=lambda x: {'color': '#2563eb', 'weight': 3, 'fillOpacity': 0}).add_to(m2)
 
+df_pts = get_all_centroids_df()
+
+if bounds:
+    south, west, north, east = bounds["south"], bounds["west"], bounds["north"], bounds["east"]
+    vis = df_pts[(df_pts["lat"] >= south) & (df_pts["lat"] <= north) & (df_pts["lon"] >= west) & (df_pts["lon"] <= east)]
+else:
+    vis = df_pts
+
+# CAP adaptativo por zoom
+if zoom >= 15:
+    MAX_PINS = 2500
+elif zoom >= 13:
     MAX_PINS = 1500
-    if not vis.empty and len(vis) > MAX_PINS and center:
+elif zoom >= 11:
+    MAX_PINS = 800
+else:
+    MAX_PINS = 400
+
+if not vis.empty and len(vis) > MAX_PINS:
+    if center:
         clat, clon = center
-        lon_scale = cos(radians(clat))
-        d = (vis["lat"] - clat).abs() + (vis["lon"] - clon).abs() * lon_scale
-        vis = vis.assign(_d=d).sort_values("_d").head(MAX_PINS).drop(columns=["_d"])
+    else:
+        clat = vis["lat"].mean(); clon = vis["lon"].mean()
+    lon_scale = cos(radians(clat))
+    d = (vis["lat"] - clat).abs() + (vis["lon"] - clon).abs() * lon_scale
+    vis = vis.assign(_d=d).sort_values("_d").head(MAX_PINS).drop(columns=["_d"])
 
-    m2 = folium.Map(prefer_canvas=True)
-    try:
-        m2.fit_bounds([[south, west], [north, east]])
-    except Exception:
-        pass
+cluster = MarkerCluster(
+    name="Pivôs",
+    disableClusteringAtZoom=16,
+    showCoverageOnHover=False,
+    spiderfyOnMaxZoom=True,
+    zoomToBoundsOnClick=True,
+    chunkedLoading=True,
+    chunkInterval=100,
+    chunkDelay=25,
+    maxClusterRadius=60
+).add_to(m2)
 
-    folium.TileLayer(
-        tiles=all_outlines_mapid['tile_fetcher'].url_format,
-        attr='Pivôs (outline EE tile)',
-        name='Pivôs (outline)',
-        overlay=True,
-        control=False
-    ).add_to(m2)
-    folium.TileLayer(
-        tiles=ndvi_mapid['tile_fetcher'].url_format,
-        attr='GEE NDVI',
-        name='NDVI',
-        overlay=True,
-        control=False
-    ).add_to(m2)
-    if sel_geojson and sel_geojson.get('features'):
-        folium.GeoJson(
-            sel_geojson,
-            name='Área do Pivô (selecionado)',
-            style_function=lambda x: {'color': '#2563eb', 'weight': 3, 'fillOpacity': 0}
-        ).add_to(m2)
+def add_numbered_marker(lat, lon, pid):
+    if HAS_BEAUTIFY:
+        icon = BeautifyIcon(
+            number=str(pid),
+            inner_icon_style='margin-top:0;',
+            border_color='#1f2937',
+            text_color='#111827',
+            background_color='#ffffff',
+            icon_shape='circle',
+            border_width=2
+        )
+        folium.Marker(location=[lat, lon], icon=icon).add_to(cluster)
+    else:
+        # fallback: marcador padrão + tooltip com número (sempre visível ao hover)
+        folium.Marker(location=[lat, lon], tooltip=str(pid)).add_to(cluster)
 
-    cluster = MarkerCluster(
-        name="Pivôs",
-        disableClusteringAtZoom=16,
-        showCoverageOnHover=False,
-        spiderfyOnMaxZoom=True,
-        zoomToBoundsOnClick=True,
-        chunkedLoading=True,
-        chunkInterval=100,
-        chunkDelay=25,
-        maxClusterRadius=60
-    ).add_to(m2)
+# adiciona pinos visíveis
+for lat, lon, pid in vis[["lat", "lon", "pid"]].itertuples(index=False):
+    add_numbered_marker(lat, lon, pid)
 
-    icon_cache = {}
-    for lat, lon, pid in vis[["lat", "lon", "pid"]].itertuples(index=False):
-        if pid not in icon_cache:
-            data_uri = svg_number_icon_data_uri(int(pid), size=26)
-            icon_cache[pid] = CustomIcon(icon_image=data_uri, icon_size=(26, 26), icon_anchor=(13, 13))
-        folium.Marker(location=[lat, lon], icon=icon_cache[pid]).add_to(cluster)
+# garante SEMPRE o pino do pivô selecionado (mesmo fora do viewport)
+sel_point = PIVOS_PT.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first().geometry().coordinates().getInfo()
+sel_lat, sel_lon = sel_point[1], sel_point[0]
+add_numbered_marker(sel_lat, sel_lon, int(selected_pivo))
 
-    with tab1:
-        st_folium(m2, use_container_width=True, height=520)
-        st.caption(f"Pinos numerados no viewport (zoom ≥ 12). Mostrando até {MAX_PINS} pinos mais próximos do centro.")
+with tab1:
+    st_folium(m2, use_container_width=True, height=520)
+    st.caption(f"Pinos numerados (BeautifyIcon). Limite por viewport: {MAX_PINS} pinos. O pivô selecionado sempre é mostrado.")
 
 # =====================
 # GRÁFICO (NDVI fixo 0.2–1)
@@ -473,20 +492,11 @@ with tab2:
             tooltip=[alt.Tooltip('date:T', title='Data'), alt.Tooltip('ndvi:Q', title='NDVI', format=".3f")]
         )
 
-        chart = alt.layer(
-            bars_precip, line_green_full, line_red_overlay, points_green, points_red
-        ).resolve_scale(
-            y='independent'
-        ).properties(
-            title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}',
-            width='container', height=360
-        ).configure_axis(
-            grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12
-        ).configure_view(
-            strokeWidth=0
-        ).configure_title(
-            fontSize=14
-        )
+        chart = alt.layer(bars_precip, line_green_full, line_red_overlay, points_green, points_red
+        ).resolve_scale(y='independent'
+        ).properties(title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}', width='container', height=360
+        ).configure_axis(grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12
+        ).configure_view(strokeWidth=0).configure_title(fontSize=14)
         st.altair_chart(chart, use_container_width=True)
 
 # =====================

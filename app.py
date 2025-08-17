@@ -39,8 +39,7 @@ for p in (CACHE_DIR, NDVI_CACHE, PREC_CACHE, MERGED_CACHE):
 @st.cache_resource(show_spinner=False)
 def init_ee_from_secrets():
     service_account_info = st.secrets["earthengine"]
-    key_data = service_account_info["private_key"].replace('\n', '
-')
+    key_data = service_account_info["private_key"]
     credentials = ee.ServiceAccountCredentials(
         service_account_info["client_email"], key_data=key_data
     )

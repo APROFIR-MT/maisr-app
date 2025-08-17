@@ -23,9 +23,16 @@ if os.path.exists("logo.png"):
 # EE INIT (secrets)
 # =====================
 sa = st.secrets["earthengine"]
-key = sa["private_key"]
-creds = ee.ServiceAccountCredentials(sa["client_email"], key)
-ee.Initialize(creds)
+
+# a chave vem em uma única linha no secrets; normalize as quebras
+key_data = sa["private_key"].replace("\\n", "\n")
+
+# >>> use key_data= (e não caminho de arquivo)
+credentials = ee.ServiceAccountCredentials(
+    sa["client_email"],
+    key_data=key_data
+)
+ee.Initialize(credentials)
 
 # =====================
 # DADOS EE

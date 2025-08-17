@@ -9,7 +9,7 @@ import altair as alt
 import folium
 import geemap
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster  # <- labels clusterizadas
+from folium.plugins import MarkerCluster, BeautifyIcon
 
 # =====================
 # CONFIG DA PÁGINA
@@ -210,7 +210,7 @@ def get_all_pivots_outline_mapid():
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def get_all_centroids_list():
-    # Lista [lat, lon, id_ref] para cluster + labels
+    # Lista [lat, lon, id_ref] para cluster + marcadores numerados
     fc = PIVOS_PT.select(['id_ref']).map(
         lambda f: ee.Feature(ee.Geometry(f.geometry()).centroid(), {'id_ref': f.get('id_ref')})
     )
@@ -312,11 +312,11 @@ if selected_pivo:
         control=False
     ).add_to(m)
 
-    # 3) TODAS AS LABELS (MarkerCluster + DivIcon)
+    # 3) MARCADORES NUMERADOS (MarkerCluster + BeautifyIcon)
     all_centroids = get_all_centroids_list()
     if all_centroids:
         label_cluster = MarkerCluster(
-            name="Rótulos",
+            name="Pivôs",
             disableClusteringAtZoom=16,
             showCoverageOnHover=False,
             spiderfyOnMaxZoom=True,
@@ -326,30 +326,17 @@ if selected_pivo:
         ).add_to(m)
 
         for lat, lon, pid in all_centroids:
-            folium.Marker(
-                location=[lat, lon],
-                icon=folium.DivIcon(
-                    html=f"""
-                        <div style="
-                            font-size:16px;
-                            font-weight:bold;
-                            color:black;
-                            text-shadow:
-                                -2px -2px 0 white,
-                                2px -2px 0 white,
-                                -2px 2px 0 white,
-                                2px 2px 0 white,
-                                0px -2px 0 white,
-                                0px 2px 0 white,
-                                -2px 0px 0 white,
-                                2px 0px 0 white;
-                        ">{pid}</div>
-                    """,
-                    icon_size=(0, 0),
-                    icon_anchor=(0, 0),
-                    class_name="pivot-label"
-                )
-            ).add_to(label_cluster)
+            icon = BeautifyIcon(
+                number=str(pid),
+                inner_icon_style='margin-top:0;',
+                border_color='#1f2937',
+                text_color='#111827',
+                background_color='#ffffff',
+                spin=False,
+                icon_shape='circle',
+                border_width=2
+            )
+            folium.Marker(location=[lat, lon], icon=icon).add_to(label_cluster)
 
     # 4) Polígono do pivô selecionado com detalhe (simplificação mínima)
     sel_geojson = get_selected_area_geojson(int(selected_pivo), simplify_m=2.0)
@@ -363,7 +350,7 @@ if selected_pivo:
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
-        st.caption("Contornos de todos os pivôs (tile), labels clusterizadas por id_ref e polígono detalhado do pivô selecionado.")
+        st.caption("Contornos de todos os pivôs (tile), marcadores numerados clusterizados e polígono detalhado do pivô selecionado.")
 
     # ===== GRÁFICO =====
     if not df.empty:

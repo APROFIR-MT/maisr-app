@@ -23,7 +23,7 @@ if os.path.exists("logo.png"):
 # EE INIT (secrets)
 # =====================
 sa = st.secrets["earthengine"]
-key = sa["private_key"].replace("\\n", "\n")
+key = sa["private_key"]
 creds = ee.ServiceAccountCredentials(sa["client_email"], key)
 ee.Initialize(creds)
 

@@ -1,3 +1,4 @@
+
 import os
 import datetime
 import base64
@@ -9,6 +10,7 @@ import altair as alt
 import folium
 import geemap
 from streamlit_folium import st_folium
+from folium.plugins import FastMarkerCluster
 
 # =====================
 # CONFIG DA PÁGINA
@@ -38,7 +40,8 @@ for p in (CACHE_DIR, NDVI_CACHE, PREC_CACHE, MERGED_CACHE):
 @st.cache_resource(show_spinner=False)
 def init_ee_from_secrets():
     service_account_info = st.secrets["earthengine"]
-    key_data = service_account_info["private_key"].replace('\\n', '\n')
+    key_data = service_account_info["private_key"].replace('\n', '
+')
     credentials = ee.ServiceAccountCredentials(
         service_account_info["client_email"], key_data=key_data
     )
@@ -184,7 +187,7 @@ if len(os.listdir(MERGED_CACHE)) == 0:
         _ = warm_cache_for_all_pivots(pivo_ids)
 
 # =====================
-# MAP HELPERS
+# MAP HELPERS (OTIMIZAÇÃO)
 # =====================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_ndvi_mapid_for(pivo_id: int, last_date: str):
@@ -197,8 +200,29 @@ def get_ndvi_mapid_for(pivo_id: int, last_date: str):
     vis = {'min': 0, 'max': 1, 'palette': ['red', 'yellow', 'green']}
     return ndvi_image.getMapId(vis)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_all_pivots_outline_mapid():
+    # Contorno de todos os pivôs como tile (leve)
+    edges = ee.Image().paint(PIVOS_AREA, 1, 2)
+    vis = {'min': 0, 'max': 1, 'palette': ['000000']}
+    return edges.getMapId(vis)
+
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def get_selected_area_geojson(pivo_id: int, simplify_m: float = 20.0):
+def get_all_centroids_list():
+    # Lista [lat, lon, id_ref] para cluster
+    fc = PIVOS_PT.select(['id_ref']).map(
+        lambda f: ee.Feature(ee.Geometry(f.geometry()).centroid(), {'id_ref': f.get('id_ref')})
+    )
+    features = fc.getInfo()['features']
+    coords = []
+    for f in features:
+        c = f['geometry']['coordinates']
+        pid = f['properties'].get('id_ref')
+        coords.append([c[1], c[0], pid])
+    return coords
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def get_selected_area_geojson(pivo_id: int, simplify_m: float = 2.0):
     feat = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(pivo_id))).first()
     if feat is None:
         return None
@@ -253,11 +277,13 @@ if selected_pivo:
 
     st.divider()
 
-    # ===== MAPA OTIMIZADO =====
+    # ===== MAPA (todos os pivôs + selecionado) =====
     last_date_pd = (df['date'].max() if not df.empty else pd.Timestamp(datetime.datetime.now()))
     last_date = last_date_pd.strftime('%Y-%m-%d')
 
     m = folium.Map(prefer_canvas=True)
+
+    # Enquadrar no selecionado (rápido)
     area_fc = PIVOS_AREA.filter(ee.Filter.eq('id_ref', int(selected_pivo))).first()
     area_geom = area_fc.geometry()
     bounds = ee.Geometry(area_geom).bounds().coordinates().getInfo()[0]
@@ -265,41 +291,56 @@ if selected_pivo:
     miny = min(c[1] for c in bounds); maxy = max(c[1] for c in bounds)
     m.fit_bounds([[miny, minx], [maxy, maxx]])
 
-    mapid = get_ndvi_mapid_for(int(selected_pivo), last_date)
+    # 1) Contorno de TODOS os pivôs (tile)
+    all_outlines_mapid = get_all_pivots_outline_mapid()
     folium.TileLayer(
-        tiles=mapid['tile_fetcher'].url_format,
+        tiles=all_outlines_mapid['tile_fetcher'].url_format,
+        attr='Pivôs (outline EE tile)',
+        name='Pivôs (outline)',
+        overlay=True,
+        control=False
+    ).add_to(m)
+
+    # 2) NDVI do mês atual (tile)
+    ndvi_mapid = get_ndvi_mapid_for(int(selected_pivo), last_date)
+    folium.TileLayer(
+        tiles=ndvi_mapid['tile_fetcher'].url_format,
         attr='GEE NDVI',
         name='NDVI',
         overlay=True,
         control=False
     ).add_to(m)
 
-    sel_geojson = get_selected_area_geojson(int(selected_pivo), simplify_m=20)
+    # 3) Pontos de TODOS os pivôs (cluster leve)
+    all_centroids = get_all_centroids_list()
+    if all_centroids:
+        FastMarkerCluster(
+            data=[[lat, lon] for lat, lon, _ in all_centroids]
+        ).add_to(m)
+        # marcador do selecionado com popup
+        try:
+            sel_latlon = next((latlon for latlon in all_centroids if int(latlon[2]) == int(selected_pivo)), None)
+            if sel_latlon:
+                folium.Marker(
+                    location=[sel_latlon[0], sel_latlon[1]],
+                    popup=folium.Popup(html=f"<b>Pivô {selected_pivo}</b>", max_width=200)
+                ).add_to(m)
+        except Exception:
+            pass
+
+    # 4) Polígono do pivô selecionado com detalhe (simplificação mínima)
+    sel_geojson = get_selected_area_geojson(int(selected_pivo), simplify_m=2.0)
     if sel_geojson and sel_geojson.get('features'):
         folium.GeoJson(
             sel_geojson,
-            name='Área do Pivô',
-            style_function=lambda x: {'color': '#2563eb', 'weight': 2, 'fillOpacity': 0}
+            name='Área do Pivô (selecionado)',
+            style_function=lambda x: {'color': '#2563eb', 'weight': 3, 'fillOpacity': 0}
         ).add_to(m)
-
-    try:
-        center = ee.Geometry(area_geom).centroid().coordinates().getInfo()
-        folium.Marker(
-            location=[center[1], center[0]],
-            icon=folium.DivIcon(html=f"""
-                <div style="
-                    font-size:16px; font-weight:bold; color:black;
-                    text-shadow: -2px -2px 0 white, 2px -2px 0 white,
-                                  -2px 2px 0 white, 2px 2px 0 white;">{selected_pivo}</div>
-            """, icon_size=(0, 0), icon_anchor=(0, 0), class_name="pivot-label")
-        ).add_to(m)
-    except Exception:
-        pass
 
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
-        st.caption("NDVI: vermelho → amarelo → verde. Área desenhada apenas do pivô selecionado.")
+        st.caption("Contornos de todos os pivôs (tile), pontos clusterizados e polígono detalhado do pivô selecionado.")
 
     # ===== GRÁFICO =====
     if not df.empty:
@@ -319,7 +360,6 @@ if selected_pivo:
                     axis=alt.Axis(format=".3f", orient='right', titleColor='green'))
         )
 
-        # pontos/segmentos abaixo do limiar
         def segments_below_threshold(local_df: pd.DataFrame, thr: float) -> pd.DataFrame:
             if local_df.empty:
                 return pd.DataFrame(columns=['date', 'ndvi', 'seg'])

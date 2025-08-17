@@ -1,4 +1,3 @@
-
 import os
 import datetime
 import base64
@@ -10,7 +9,7 @@ import altair as alt
 import folium
 import geemap
 from streamlit_folium import st_folium
-from folium.plugins import FastMarkerCluster
+from folium.plugins import MarkerCluster  # <- labels clusterizadas
 
 # =====================
 # CONFIG DA PÁGINA
@@ -40,7 +39,7 @@ for p in (CACHE_DIR, NDVI_CACHE, PREC_CACHE, MERGED_CACHE):
 @st.cache_resource(show_spinner=False)
 def init_ee_from_secrets():
     service_account_info = st.secrets["earthengine"]
-    key_data = service_account_info["private_key"]
+    key_data = service_account_info["private_key"].replace('\\n', '\n')
     credentials = ee.ServiceAccountCredentials(
         service_account_info["client_email"], key_data=key_data
     )
@@ -119,6 +118,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
         return ee.Image(ee.Algorithms.If(filtered.size().eq(0), empty_case(), non_empty_case()))
 
     ndvi_coll = ee.ImageCollection(dates.map(monthly_ndvi))
+
     def ndvi_extract(image):
         mean = image.reduceRegion(
             reducer=ee.Reducer.mean(), geometry=area, scale=250, bestEffort=True, maxPixels=1e13
@@ -127,6 +127,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             'date': ee.Date(image.get('system:time_start')).format('YYYY-MM'),
             'ndvi': ee.Algorithms.If(ee.Algorithms.IsEqual(mean, None), 0, mean)
         })
+
     ndvi_fc = ndvi_coll.map(ndvi_extract)
     ndvi_feats = ndvi_fc.toList(ndvi_fc.size()).getInfo()
     df_ndvi = pd.DataFrame([f['properties'] for f in ndvi_feats])
@@ -148,6 +149,7 @@ def build_and_store_series_for_pivot(pivo_id: int, start_date: str = '2021-01-01
             'date': start.format('YYYY-MM'),
             'precip_mm': ee.Algorithms.If(ee.Algorithms.IsEqual(mean_mm, None), 0, mean_mm)
         })
+
     prec_fc = ee.FeatureCollection(dates.map(month_prec))
     prec_feats = prec_fc.toList(prec_fc.size()).getInfo()
     df_prec = pd.DataFrame([f['properties'] for f in prec_feats])
@@ -208,7 +210,7 @@ def get_all_pivots_outline_mapid():
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def get_all_centroids_list():
-    # Lista [lat, lon, id_ref] para cluster
+    # Lista [lat, lon, id_ref] para cluster + labels
     fc = PIVOS_PT.select(['id_ref']).map(
         lambda f: ee.Feature(ee.Geometry(f.geometry()).centroid(), {'id_ref': f.get('id_ref')})
     )
@@ -217,7 +219,7 @@ def get_all_centroids_list():
     for f in features:
         c = f['geometry']['coordinates']
         pid = f['properties'].get('id_ref')
-        coords.append([c[1], c[0], pid])
+        coords.append([c[1], c[0], pid])  # [lat, lon, id]
     return coords
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
@@ -310,22 +312,44 @@ if selected_pivo:
         control=False
     ).add_to(m)
 
-    # 3) Pontos de TODOS os pivôs (cluster leve)
+    # 3) TODAS AS LABELS (MarkerCluster + DivIcon)
     all_centroids = get_all_centroids_list()
     if all_centroids:
-        FastMarkerCluster(
-            data=[[lat, lon] for lat, lon, _ in all_centroids]
+        label_cluster = MarkerCluster(
+            name="Rótulos",
+            disableClusteringAtZoom=16,
+            showCoverageOnHover=False,
+            spiderfyOnMaxZoom=True,
+            zoomToBoundsOnClick=True,
+            chunkedLoading=True,
+            maxClusterRadius=60
         ).add_to(m)
-        # marcador do selecionado com popup
-        try:
-            sel_latlon = next((latlon for latlon in all_centroids if int(latlon[2]) == int(selected_pivo)), None)
-            if sel_latlon:
-                folium.Marker(
-                    location=[sel_latlon[0], sel_latlon[1]],
-                    popup=folium.Popup(html=f"<b>Pivô {selected_pivo}</b>", max_width=200)
-                ).add_to(m)
-        except Exception:
-            pass
+
+        for lat, lon, pid in all_centroids:
+            folium.Marker(
+                location=[lat, lon],
+                icon=folium.DivIcon(
+                    html=f"""
+                        <div style="
+                            font-size:16px;
+                            font-weight:bold;
+                            color:black;
+                            text-shadow:
+                                -2px -2px 0 white,
+                                2px -2px 0 white,
+                                -2px 2px 0 white,
+                                2px 2px 0 white,
+                                0px -2px 0 white,
+                                0px 2px 0 white,
+                                -2px 0px 0 white,
+                                2px 0px 0 white;
+                        ">{pid}</div>
+                    """,
+                    icon_size=(0, 0),
+                    icon_anchor=(0, 0),
+                    class_name="pivot-label"
+                )
+            ).add_to(label_cluster)
 
     # 4) Polígono do pivô selecionado com detalhe (simplificação mínima)
     sel_geojson = get_selected_area_geojson(int(selected_pivo), simplify_m=2.0)
@@ -339,13 +363,12 @@ if selected_pivo:
     tab1, tab2 = st.tabs(["🗺️ Mapa", "📈 Séries NDVI + Precip"])
     with tab1:
         st_folium(m, use_container_width=True, height=520)
-        st.caption("Contornos de todos os pivôs (tile), pontos clusterizados e polígono detalhado do pivô selecionado.")
+        st.caption("Contornos de todos os pivôs (tile), labels clusterizadas por id_ref e polígono detalhado do pivô selecionado.")
 
     # ===== GRÁFICO =====
     if not df.empty:
-        ndvi_min = max(threshold, float(df['ndvi'].min()))
-        ndvi_max = float(df['ndvi'].max())
-        ndvi_scale = alt.Scale(domain=[ndvi_min, ndvi_max])
+        # eixo NDVI fixo 0.2 → 1.0
+        ndvi_scale = alt.Scale(domain=[0.2, 1])
 
         bars_precip = alt.Chart(df).mark_bar(color='#3b82f6', opacity=0.5).encode(
             x=alt.X('date:T', title='Data'),
@@ -359,6 +382,7 @@ if selected_pivo:
                     axis=alt.Axis(format=".3f", orient='right', titleColor='green'))
         )
 
+        # segmentos/pontos abaixo do limiar
         def segments_below_threshold(local_df: pd.DataFrame, thr: float) -> pd.DataFrame:
             if local_df.empty:
                 return pd.DataFrame(columns=['date', 'ndvi', 'seg'])
@@ -400,6 +424,7 @@ if selected_pivo:
             return pd.DataFrame(seg_rows, columns=['date','ndvi','seg']).drop_duplicates().sort_values('date')
 
         df_below = segments_below_threshold(df[['date','ndvi']].copy(), threshold)
+
         line_red_overlay = alt.Chart(df_below).mark_line(color='red', strokeWidth=3).encode(
             x='date:T', y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale), detail='seg:N'
         )

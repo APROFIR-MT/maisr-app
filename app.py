@@ -346,7 +346,7 @@ with tab2:
         st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
     else:
         # clamp VISUAL para não sumir quando ndvi < 0.2
-        df_plot = df.copy()
+        df_plot = df.copy().reset_index(drop=True)
         df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
 
         df_below = segments_below_threshold(df[["date", "ndvi"]].copy(), float(threshold))

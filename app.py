@@ -22,6 +22,10 @@ st.markdown(
 if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
+# Força recriação do gráfico em qualquer rerun (sidebar abrir/fechar, trocar abas, etc.)
+if "_chart_rev" not in st.session_state:
+    st.session_state["_chart_rev"] = 0
+
 # Altair: evita sumiço de camadas por limite de linhas
 alt.data_transformers.disable_max_rows()
 

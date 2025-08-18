@@ -200,7 +200,7 @@ selected_pivo = st.sidebar.selectbox(
     key="selected_pivo",
 )
 threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
-st.sidebar.caption("Clique no polígono para ver o número do pivô. Eixo NDVI fixo começa em 0,2.")
+st.sidebar.caption("Ajuste para destacar valores abaixo do limiar. NDVI ≤ Limiar em vermelho. ")
 
 # =====================
 # CARREGA SÉRIES (rápido; cache sessão → sem I/O em pan/zoom/click)
@@ -397,7 +397,7 @@ with tab2:
         )
 
         st.altair_chart(chart, use_container_width=True)
-        st.caption("Obs.: valores de NDVI < 0,20 são desenhados encostados em 0,20 apenas para visualização; o tooltip mostra o valor real.")
+        st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")
 
 # =====================
 # EXPORT CSV

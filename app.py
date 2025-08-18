@@ -1,19 +1,16 @@
 import os
 import datetime
 import base64
-import uuid
+import uuid  # <-- para key aleatória do gráfico
 
 import streamlit as st
 import ee
 import pandas as pd
+import altair as alt
 import folium
 import geemap
 from streamlit_folium import st_folium
 from folium.features import GeoJsonPopup
-
-# NOVO: Plotly
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # =====================
 # CONFIGURAÇÃO BÁSICA
@@ -26,11 +23,14 @@ st.markdown(
 if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", use_container_width=True)
 
-# Força recriação do gráfico em qualquer rerun (sidebar abrir/fechar, trocar abas, etc.)
+# Flags sessão
 if "_chart_rev" not in st.session_state:
     st.session_state["_chart_rev"] = 0
 if "__pivot_changed" not in st.session_state:
     st.session_state["__pivot_changed"] = False
+
+# Altair: evita limite de linhas
+alt.data_transformers.disable_max_rows()
 
 # =====================
 # AUTENTICAÇÃO EARTH ENGINE (key_data=)
@@ -215,7 +215,7 @@ threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
 st.sidebar.caption("Ajuste para destacar valores abaixo do limiar. NDVI ≤ Limiar em vermelho. ")
 
 # =====================
-# CARREGA SÉRIES (rápido; cache sessão → sem I/O em pan/zoom/click)
+# CARREGA SÉRIES
 # =====================
 with st.spinner("🔄 Carregando séries (NDVI + Precipitação) do cache..."):
     df = get_df_for_pivot(int(selected_pivo))
@@ -324,7 +324,7 @@ with tab1:
     except Exception:
         pass
 
-    # Todos os pivôs como GeoJSON — popup com id_ref (número só ao clicar)
+    # Todos os pivôs — popup com id_ref (número só ao clicar)
     try:
         gj_all = all_pivots_geojson_simplified(tol_m=3.0)
         if gj_all["features"]:
@@ -342,108 +342,122 @@ with tab1:
     st_folium(m, use_container_width=True, height=700, returned_objects=[])
 
 # =====================
-# GRÁFICO (PLOTLY)
+# GRÁFICO — Altair
 # =====================
 with tab2:
     if df.empty:
         st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
     else:
-        # base + clamp visual (eixo fixo começa em 0.2)
+        # snapshot + clamp visual (NDVI ≥ 0.2)
         df_plot = df.copy().reset_index(drop=True)
         df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
 
-        # pontos acima/abaixo do limiar
         thr = float(threshold)
         df_above = df_plot[df_plot["ndvi"] > thr]
         df_below_pts = df_plot[df_plot["ndvi"] <= thr]
 
-        # segmentos abaixo do limiar
-        segs = segments_below_threshold(df[["date","ndvi"]].copy(), thr)
+        segs = segments_below_threshold(df[["date", "ndvi"]].copy(), thr)
         if not segs.empty:
             segs = segs.copy()
             segs["ndvi_plot"] = segs["ndvi"].apply(lambda v: max(v, 0.200001))
+        else:
+            segs = pd.DataFrame(columns=["date", "ndvi_plot", "seg"])
 
-        # figura com dois eixos Y
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        # Barras de precipitação (eixo esquerdo)
-        fig.add_trace(
-            go.Bar(
-                x=df_plot["date"], y=df_plot["precip_mm"],
-                name="Precipitação (mm/mês)", opacity=0.5
-            ),
-            secondary_y=False
-        )
-        # Linha NDVI (eixo direito)
-        fig.add_trace(
-            go.Scatter(
-                x=df_plot["date"], y=df_plot["ndvi_plot"],
-                name="NDVI", mode="lines", line=dict(width=2)
-            ),
-            secondary_y=True
-        )
-        # Pontos verdes
-        if not df_above.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=df_above["date"], y=df_above["ndvi_plot"],
-                    name="NDVI acima do limiar", mode="markers",
-                    marker=dict(size=7), hovertemplate="Data=%{x|%Y-%m}<br>NDVI=%{customdata:.3f}",
-                    customdata=df_above["ndvi"]
-                ),
-                secondary_y=True
-            )
-        # Pontos vermelhos
-        if not df_below_pts.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=df_below_pts["date"], y=df_below_pts["ndvi_plot"],
-                    name="NDVI ≤ limiar", mode="markers",
-                    marker=dict(size=7), hovertemplate="Data=%{x|%Y-%m}<br>NDVI=%{customdata:.3f}",
-                    customdata=df_below_pts["ndvi"]
-                ),
-                secondary_y=True
-            )
-        # Segmentos vermelhos (trechos abaixo)
-        if not segs.empty:
-            # plota por segmento para não conectar entre si
-            for seg_id, g in segs.groupby("seg"):
-                fig.add_trace(
-                    go.Scatter(
-                        x=g["date"], y=g["ndvi_plot"],
-                        mode="lines", name=f"NDVI ≤ limiar (seg {seg_id})",
-                        showlegend=(seg_id == segs["seg"].min())
-                    ),
-                    secondary_y=True
-                )
+        ndvi_scale = alt.Scale(domain=[0.2, 1])
 
-        # Layout / eixos
-        fig.update_yaxes(title_text="Precipitação (mm/mês)", secondary_y=False)
-        fig.update_yaxes(title_text="NDVI", range=[0.2, 1], secondary_y=True)
-        fig.update_xaxes(title_text="Data")
+        # Nomes únicos por rerun para datasets do Vega (evita "Unrecognized data set")
+        base_name = f"p{int(selected_pivo)}_rev{st.session_state['_chart_rev']}"
 
-        fig.update_layout(
-            height=360,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            margin=dict(l=40, r=90, t=40, b=30),
-            hovermode="x unified",
+        bars_precip = alt.Chart(
+            alt.InlineData(values=df_plot[["date", "precip_mm"]].to_dict(orient="records"),
+                           name=f"{base_name}_prec")
+        ).mark_bar(opacity=0.5, color="#3b82f6").encode(
+            x=alt.X("date:T", title="Data"),
+            y=alt.Y("precip_mm:Q", title="Precipitação (mm/mês)",
+                    axis=alt.Axis(titleColor="#3b82f6")),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("precip_mm:Q", title="Precipitação (mm)", format=".2f")]
         )
 
-        # força remount em todo rerun relevante
+        line_ndvi = alt.Chart(
+            alt.InlineData(values=df_plot[["date", "ndvi_plot", "ndvi"]].to_dict(orient="records"),
+                           name=f"{base_name}_ndvi")
+        ).mark_line(color="green", strokeWidth=2).encode(
+            x=alt.X("date:T", title="Data"),
+            y=alt.Y("ndvi_plot:Q", title="NDVI", scale=ndvi_scale,
+                    axis=alt.Axis(format=".3f", orient="right", titleColor="green")),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("ndvi:Q", title="NDVI (real)", format=".3f")]
+        )
+
+        pts_green = alt.Chart(
+            alt.InlineData(values=df_above[["date", "ndvi_plot", "ndvi"]].to_dict(orient="records"),
+                           name=f"{base_name}_pts_g")
+        ).mark_point(color="green", filled=True, opacity=1).encode(
+            x="date:T",
+            y=alt.Y("ndvi_plot:Q", axis=None, scale=ndvi_scale),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("ndvi:Q", title="NDVI (real)", format=".3f")]
+        )
+
+        pts_red = alt.Chart(
+            alt.InlineData(values=df_below_pts[["date", "ndvi_plot", "ndvi"]].to_dict(orient="records"),
+                           name=f"{base_name}_pts_r")
+        ).mark_point(color="red", filled=True, opacity=1).encode(
+            x="date:T",
+            y=alt.Y("ndvi_plot:Q", axis=None, scale=ndvi_scale),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("ndvi:Q", title="NDVI (real)", format=".3f")]
+        )
+
+        red_layer = alt.Chart(
+            alt.InlineData(values=segs[["date", "ndvi_plot", "seg"]].to_dict(orient="records"),
+                           name=f"{base_name}_segs")
+        ).mark_line(color="red", strokeWidth=3).encode(
+            x="date:T",
+            y=alt.Y("ndvi_plot:Q", axis=None, scale=ndvi_scale),
+            detail="seg:N"
+        )
+
+        chart = alt.layer(
+            bars_precip, line_ndvi, red_layer, pts_green, pts_red
+        ).resolve_scale(
+            y="independent"
+        ).properties(
+            title=f"NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}",
+            width="container", height=360
+        ).configure_axis(
+            grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12, titlePadding=6
+        ).configure_view(
+            strokeWidth=0
+        ).configure_title(
+            fontSize=14
+        )
+
+        # Autosize + padding para não cortar título do eixo direito
+        chart = chart.properties(
+            padding={"left": 40, "right": 90, "top": 10, "bottom": 30}
+        ).configure(
+            autosize=alt.AutoSizeParams(type="fit-x", contains="padding", resize=True)
+        )
+
+        # Remount garantido em todo rerun (sidebar, abas, seleção no mapa)
         st.session_state["_chart_rev"] += 1
-        chart_key = f"plotly-ndvi-{int(selected_pivo)}-{thr:.3f}-{len(df_plot)}-{st.session_state['_chart_rev']}"
-        st.plotly_chart(fig, use_container_width=True, key=chart_key)
+        chart_key = f"alt-ndvi-{uuid.uuid4()}"
+        st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
 
-        st.caption("Curva contínua (NDVI) no eixo direito; trechos ≤ limiar em vermelho; barras azuis = precipitação mensal.")
+        st.session_state["__pivot_changed"] = False
+        st.caption("Curva contínua em verde; trechos ≤ limiar em vermelho; barras azuis = precipitação mensal.")
 
 # =====================
 # EXPORT CSV
 # =====================
 if not df.empty:
-    csv = df[['date','ndvi','precip_mm']].copy()
-    csv['date'] = csv['date'].dt.strftime('%Y-%m')
+    csv = df[["date","ndvi","precip_mm"]].copy()
+    csv["date"] = csv["date"].dt.strftime("%Y-%m")
     b64 = base64.b64encode(csv.to_csv(index=False).encode()).decode()
     st.markdown(
         f'<a href="data:text/csv;base64,{b64}" download="ndvi_precip_{selected_pivo}.csv">'
-        '📥 Baixar dados (NDVI + Precip) CSV</a>',
+        "📥 Baixar dados (NDVI + Precip) CSV</a>",
         unsafe_allow_html=True
     )

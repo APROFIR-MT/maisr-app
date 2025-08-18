@@ -25,6 +25,8 @@ if os.path.exists("logo.png"):
 # Força recriação do gráfico em qualquer rerun (sidebar abrir/fechar, trocar abas, etc.)
 if "_chart_rev" not in st.session_state:
     st.session_state["_chart_rev"] = 0
+if "__pivot_changed" not in st.session_state:
+    st.session_state["__pivot_changed"] = False
 
 # Altair: evita sumiço de camadas por limite de linhas
 alt.data_transformers.disable_max_rows()
@@ -128,7 +130,7 @@ def _compute_series_from_ee(pivo_id: int) -> pd.DataFrame:
     df_prec["precip_mm"] = pd.to_numeric(df_prec["precip_mm"], errors="coerce").fillna(0.0)
     df_prec = df_prec.sort_values("date")
 
-    # >>> FIX AQUI: on="date" <<<
+    # merge correto
     df = pd.merge(df_ndvi, df_prec, on="date", how="left")
     return df
 
@@ -196,12 +198,9 @@ pivo_ids = pivo_ids_sorted()
 if "selected_pivo" not in st.session_state:
     st.session_state["selected_pivo"] = pivo_ids[0] if pivo_ids else None
 
-st.sidebar.markdown("### Parâmetros")
 def _on_pivot_change():
-    # marca troca para evitar qualquer resquício visual
     st.session_state["__pivot_changed"] = True
-    # (opcional) se quiser forçar recarregar a série do pivô do disco na próxima vez:
-    # st.session_state.get("df_cache_by_pivot", {}).pop(int(st.session_state["selected_pivo"]), None)
+    st.session_state["_chart_rev"] += 1  # garante nova key
 
 st.sidebar.markdown("### Parâmetros")
 selected_pivo = st.sidebar.selectbox(
@@ -339,7 +338,7 @@ with tab1:
         st.warning("Falha ao carregar a camada de pivôs.")
         st.exception(e)
 
-    # ÚNICO render; não coletamos retornos para evitar reruns pesados
+    # ÚNICO render
     st_folium(m, use_container_width=True, height=700, returned_objects=[])
 
 # =====================
@@ -352,8 +351,10 @@ with tab2:
         # clamp VISUAL para não sumir quando ndvi < 0.2
         df_plot = df.copy().reset_index(drop=True)
         df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
+
+        # incremento garante key única por rerun/aba/resize
         st.session_state["_chart_rev"] += 1
-        
+
         df_below = segments_below_threshold(df[["date", "ndvi"]].copy(), float(threshold))
         df_below_plot = df_below.copy()
         if not df_below_plot.empty:
@@ -402,29 +403,22 @@ with tab2:
             title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}',
             width='container', height=360
         ).configure_axis(
-            grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12
+            grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12, titlePadding=6
         ).configure_view(
             strokeWidth=0
         ).configure_title(
             fontSize=14
         )
 
-        chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state.get('__pivot_changed', False)}"
-        # Autosize para reagir melhor à variação de largura; padding garante espaço p/ títulos
-        chart = chart.configure_axis(
-            titlePadding=6
-                ).configure_view(
-                    strokeWidth=0
-                ).properties(
-                width='container',
-                height=360,  # ajuste se quiser
-                padding={'left': 40, 'right': 90, 'top': 10, 'bottom': 30}
-            ).configure(
-                autosize=alt.AutoSizeParams(type='fit-x', contains='padding')
-            )
+        # Autosize + padding para não cortar título do eixo direito
+        chart = chart.properties(
+            padding={'left': 40, 'right': 90, 'top': 10, 'bottom': 30}
+        ).configure(
+            autosize=alt.AutoSizeParams(type='fit-x', contains='padding')
+        )
 
-chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state['_chart_rev']}"
-st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
+        chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state['_chart_rev']}"
+        st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
 
         st.session_state["__pivot_changed"] = False
         st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")

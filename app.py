@@ -352,7 +352,8 @@ with tab2:
         # clamp VISUAL para não sumir quando ndvi < 0.2
         df_plot = df.copy().reset_index(drop=True)
         df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
-
+        st.session_state["_chart_rev"] += 1
+        
         df_below = segments_below_threshold(df[["date", "ndvi"]].copy(), float(threshold))
         df_below_plot = df_below.copy()
         if not df_below_plot.empty:

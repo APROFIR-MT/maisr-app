@@ -193,11 +193,19 @@ if "selected_pivo" not in st.session_state:
     st.session_state["selected_pivo"] = pivo_ids[0] if pivo_ids else None
 
 st.sidebar.markdown("### Parâmetros")
+def _on_pivot_change():
+    # marca troca para evitar qualquer resquício visual
+    st.session_state["__pivot_changed"] = True
+    # (opcional) se quiser forçar recarregar a série do pivô do disco na próxima vez:
+    # st.session_state.get("df_cache_by_pivot", {}).pop(int(st.session_state["selected_pivo"]), None)
+
+st.sidebar.markdown("### Parâmetros")
 selected_pivo = st.sidebar.selectbox(
     "🧩 Selecione o Pivô",
     options=pivo_ids,
     index=pivo_ids.index(st.session_state["selected_pivo"]) if st.session_state["selected_pivo"] in pivo_ids else 0,
     key="selected_pivo",
+    on_change=_on_pivot_change,
 )
 threshold = st.sidebar.slider("Limiar (NDVI)", 0.0, 1.0, 0.2, 0.01)
 st.sidebar.caption("Ajuste para destacar valores abaixo do limiar. NDVI ≤ Limiar em vermelho. ")

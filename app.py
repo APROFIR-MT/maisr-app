@@ -328,7 +328,7 @@ with tab1:
         st.exception(e)
 
     # ÚNICO render; não coletamos retornos para evitar reruns pesados
-    st_folium(m, use_container_width=True, height=780, returned_objects=[])
+    st_folium(m, use_container_width=True, height=700, returned_objects=[])
 
 # =====================
 # GRÁFICO — NDVI fixo [0.2, 1] + pontos + trechos vermelhos

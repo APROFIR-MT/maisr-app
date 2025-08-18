@@ -396,7 +396,9 @@ with tab2:
             fontSize=14
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state.get('__pivot_changed', False)}"
+        st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
+        st.session_state["__pivot_changed"] = False
         st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")
 
 # =====================

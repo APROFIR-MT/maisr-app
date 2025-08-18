@@ -1,6 +1,7 @@
 import os
 import datetime
 import base64
+import uuid  # <<< para key aleatória do gráfico
 
 import streamlit as st
 import ee
@@ -352,7 +353,7 @@ with tab2:
         df_plot = df.copy().reset_index(drop=True)
         df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
 
-        # incremento garante key única por rerun/aba/resize
+        # incremento garante nova key
         st.session_state["_chart_rev"] += 1
 
         df_below = segments_below_threshold(df[["date", "ndvi"]].copy(), float(threshold))
@@ -414,12 +415,12 @@ with tab2:
         chart = chart.properties(
             padding={'left': 40, 'right': 90, 'top': 10, 'bottom': 30}
         ).configure(
-            autosize=alt.AutoSizeParams(type='fit-x', contains='padding')
+            autosize=alt.AutoSizeParams(type='fit-x', contains='padding', resize=True)
         )
 
-        # >>> Render robusto: usa vega_lite_chart com key forte
-        chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state['_chart_rev']}"
-        st.vega_lite_chart(chart.to_dict(), use_container_width=True, theme=None, key=chart_key)
+        # >>> Render robusto: key aleatória a cada rerun GARANTE remount
+        hard_key = f"ndvi-chart-{uuid.uuid4()}"
+        st.vega_lite_chart(chart.to_dict(), use_container_width=True, theme=None, key=hard_key)
 
         st.session_state["__pivot_changed"] = False
         st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")

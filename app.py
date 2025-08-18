@@ -1,7 +1,6 @@
 import os
 import datetime
 import base64
-import uuid  # <<< para key aleatória do gráfico
 
 import streamlit as st
 import ee
@@ -353,56 +352,68 @@ with tab2:
         df_plot = df.copy().reset_index(drop=True)
         df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
 
-        # incremento garante nova key
-        st.session_state["_chart_rev"] += 1
+        # datasets prontos p/ cada camada (evita transform_filter e dataset compartilhado)
+        df_above = df_plot[df_plot["ndvi"] > float(threshold)]
+        df_below_pts = df_plot[df_plot["ndvi"] <= float(threshold)]
 
         df_below = segments_below_threshold(df[["date", "ndvi"]].copy(), float(threshold))
-        df_below_plot = df_below.copy()
-        if not df_below_plot.empty:
+        if not df_below.empty:
+            df_below_plot = df_below.copy()
             df_below_plot["ndvi_plot"] = df_below_plot["ndvi"].apply(lambda v: max(v, 0.200001))
+        else:
+            df_below_plot = pd.DataFrame(columns=["date", "ndvi_plot", "seg"])
 
         ndvi_scale = alt.Scale(domain=[0.2, 1])
 
-        base = alt.Chart(df_plot).encode(x=alt.X('date:T', title='Data'))
-
-        bars_precip = base.mark_bar(opacity=0.5, color='#3b82f6').encode(
-            y=alt.Y('precip_mm:Q', title='Precipitação (mm/mês)', axis=alt.Axis(titleColor='#3b82f6')),
-            tooltip=[alt.Tooltip('date:T', title='Data'),
-                     alt.Tooltip('precip_mm:Q', title='Precipitação (mm)', format='.2f')]
+        # Cada camada com dados inline (values=...), sem "base" compartilhada
+        bars_precip = alt.Chart(
+            {"values": df_plot[["date", "precip_mm"]].to_dict(orient="records")}
+        ).mark_bar(opacity=0.5, color="#3b82f6").encode(
+            x=alt.X("date:T", title="Data"),
+            y=alt.Y("precip_mm:Q", title="Precipitação (mm/mês)", axis=alt.Axis(titleColor="#3b82f6")),
+            tooltip=[
+                alt.Tooltip("date:T", title="Data"),
+                alt.Tooltip("precip_mm:Q", title="Precipitação (mm)", format=".2f"),
+            ],
         )
 
-        line_ndvi = base.mark_line(color='green', strokeWidth=2).encode(
-            y=alt.Y('ndvi_plot:Q', title='NDVI', scale=ndvi_scale,
-                    axis=alt.Axis(format='.3f', orient='right', titleColor='green'))
+        line_ndvi = alt.Chart(
+            {"values": df_plot[["date", "ndvi_plot", "ndvi"]].to_dict(orient="records")}
+        ).mark_line(color="green", strokeWidth=2).encode(
+            x=alt.X("date:T", title="Data"),
+            y=alt.Y("ndvi_plot:Q", title="NDVI", scale=ndvi_scale,
+                    axis=alt.Axis(format=".3f", orient="right", titleColor="green")),
         )
 
-        pts_green = alt.Chart(df_plot).transform_filter(
-            alt.datum.ndvi > float(threshold)
-        ).mark_point(color='green', filled=True, opacity=1).encode(
-            x='date:T',
-            y=alt.Y('ndvi_plot:Q', axis=None, scale=ndvi_scale),
-            tooltip=[alt.Tooltip('date:T', title='Data'),
-                     alt.Tooltip('ndvi:Q', title='NDVI (real)', format='.3f')]
+        pts_green = alt.Chart(
+            {"values": df_above[["date", "ndvi_plot", "ndvi"]].to_dict(orient="records")}
+        ).mark_point(color="green", filled=True, opacity=1).encode(
+            x="date:T",
+            y=alt.Y("ndvi_plot:Q", axis=None, scale=ndvi_scale),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("ndvi:Q", title="NDVI (real)", format=".3f")],
         )
 
-        pts_red = alt.Chart(df_plot).transform_filter(
-            alt.datum.ndvi <= float(threshold)
-        ).mark_point(color='red', filled=True, opacity=1).encode(
-            x='date:T',
-            y=alt.Y('ndvi_plot:Q', axis=None, scale=ndvi_scale),
-            tooltip=[alt.Tooltip('date:T', title='Data'),
-                     alt.Tooltip('ndvi:Q', title='NDVI (real)', format='.3f')]
+        pts_red = alt.Chart(
+            {"values": df_below_pts[["date", "ndvi_plot", "ndvi"]].to_dict(orient="records")}
+        ).mark_point(color="red", filled=True, opacity=1).encode(
+            x="date:T",
+            y=alt.Y("ndvi_plot:Q", axis=None, scale=ndvi_scale),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("ndvi:Q", title="NDVI (real)", format=".3f")],
         )
 
-        red_layer = alt.Chart(df_below_plot).mark_line(color='red', strokeWidth=3).encode(
-            x='date:T', y=alt.Y('ndvi_plot:Q', axis=None, scale=ndvi_scale), detail='seg:N'
+        red_layer = alt.Chart(
+            {"values": df_below_plot[["date", "ndvi_plot", "seg"]].to_dict(orient="records")}
+        ).mark_line(color="red", strokeWidth=3).encode(
+            x="date:T", y=alt.Y("ndvi_plot:Q", axis=None, scale=ndvi_scale), detail="seg:N"
         )
 
         chart = alt.layer(bars_precip, line_ndvi, red_layer, pts_green, pts_red
-        ).resolve_scale(y='independent'
+        ).resolve_scale(y="independent"
         ).properties(
-            title=f'NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}',
-            width='container', height=360
+            title=f"NDVI (linha) x Precipitação (barras) - Pivô {selected_pivo}",
+            width="container", height=360
         ).configure_axis(
             grid=True, gridOpacity=0.15, labelFontSize=11, titleFontSize=12, titlePadding=6
         ).configure_view(
@@ -413,27 +424,33 @@ with tab2:
 
         # Autosize + padding para não cortar título do eixo direito
         chart = chart.properties(
-            padding={'left': 40, 'right': 90, 'top': 10, 'bottom': 30}
+            padding={"left": 40, "right": 90, "top": 10, "bottom": 30}
         ).configure(
-            autosize=alt.AutoSizeParams(type='fit-x', contains='padding', resize=True)
+            autosize=alt.AutoSizeParams(type="fit-x", contains="padding", resize=True)
         )
 
-        # >>> Render robusto: key aleatória a cada rerun GARANTE remount
-        hard_key = f"ndvi-chart-{uuid.uuid4()}"
-        st.vega_lite_chart(chart.to_dict(), use_container_width=True, theme=None, key=hard_key)
+        # key muda todo rerun, impedindo reaproveitar componente antigo
+        st.session_state["_chart_rev"] += 1
+        chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{len(df_plot)}-{st.session_state['_chart_rev']}"
+        st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
 
         st.session_state["__pivot_changed"] = False
         st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")
 
 # =====================
+# MAPA (ÚNICO) — render no fim para evitar reruns na montagem do gráfico
+# (opcional; pode deixar onde estava, já está estável)
+# =====================
+
+# =====================
 # EXPORT CSV
 # =====================
 if not df.empty:
-    csv = df[['date','ndvi','precip_mm']].copy()
-    csv['date'] = csv['date'].dt.strftime('%Y-%m')
+    csv = df[["date","ndvi","precip_mm"]].copy()
+    csv["date"] = csv["date"].dt.strftime("%Y-%m")
     b64 = base64.b64encode(csv.to_csv(index=False).encode()).decode()
     st.markdown(
         f'<a href="data:text/csv;base64,{b64}" download="ndvi_precip_{selected_pivo}.csv">'
-        '📥 Baixar dados (NDVI + Precip) CSV</a>',
+        "📥 Baixar dados (NDVI + Precip) CSV</a>",
         unsafe_allow_html=True
     )

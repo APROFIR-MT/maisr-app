@@ -417,8 +417,9 @@ with tab2:
             autosize=alt.AutoSizeParams(type='fit-x', contains='padding')
         )
 
+        # >>> Render robusto: usa vega_lite_chart com key forte
         chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state['_chart_rev']}"
-        st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
+        st.vega_lite_chart(chart.to_dict(), use_container_width=True, theme=None, key=chart_key)
 
         st.session_state["__pivot_changed"] = False
         st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")

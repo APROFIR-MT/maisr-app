@@ -124,6 +124,7 @@ def _compute_series_from_ee(pivo_id: int) -> pd.DataFrame:
     df_prec["precip_mm"] = pd.to_numeric(df_prec["precip_mm"], errors="coerce").fillna(0.0)
     df_prec = df_prec.sort_values("date")
 
+    # >>> FIX AQUI: on="date" <<<
     df = pd.merge(df_ndvi, df_prec, on="date", how="left")
     return df
 
@@ -336,9 +337,18 @@ with tab2:
     if df.empty:
         st.warning("Sem dados para o período/área selecionados (NDVI/precipitação).")
     else:
+        # clamp VISUAL para não sumir quando ndvi < 0.2
+        df_plot = df.copy()
+        df_plot["ndvi_plot"] = df_plot["ndvi"].apply(lambda v: max(v, 0.200001))
+
+        df_below = segments_below_threshold(df[["date", "ndvi"]].copy(), float(threshold))
+        df_below_plot = df_below.copy()
+        if not df_below_plot.empty:
+            df_below_plot["ndvi_plot"] = df_below_plot["ndvi"].apply(lambda v: max(v, 0.200001))
+
         ndvi_scale = alt.Scale(domain=[0.2, 1])
 
-        base = alt.Chart(df).encode(x=alt.X('date:T', title='Data'))
+        base = alt.Chart(df_plot).encode(x=alt.X('date:T', title='Data'))
 
         bars_precip = base.mark_bar(opacity=0.5, color='#3b82f6').encode(
             y=alt.Y('precip_mm:Q', title='Precipitação (mm/mês)', axis=alt.Axis(titleColor='#3b82f6')),
@@ -347,32 +357,30 @@ with tab2:
         )
 
         line_ndvi = base.mark_line(color='green', strokeWidth=2).encode(
-            y=alt.Y('ndvi:Q', title='NDVI', scale=ndvi_scale,
+            y=alt.Y('ndvi_plot:Q', title='NDVI', scale=ndvi_scale,
                     axis=alt.Axis(format='.3f', orient='right', titleColor='green'))
         )
 
-        pts_green = base.transform_filter(
+        pts_green = alt.Chart(df_plot).transform_filter(
             alt.datum.ndvi > float(threshold)
         ).mark_point(color='green', filled=True, opacity=1).encode(
-            y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale),
+            x='date:T',
+            y=alt.Y('ndvi_plot:Q', axis=None, scale=ndvi_scale),
             tooltip=[alt.Tooltip('date:T', title='Data'),
-                     alt.Tooltip('ndvi:Q', title='NDVI', format='.3f')]
+                     alt.Tooltip('ndvi:Q', title='NDVI (real)', format='.3f')]
         )
 
-        pts_red = base.transform_filter(
+        pts_red = alt.Chart(df_plot).transform_filter(
             alt.datum.ndvi <= float(threshold)
         ).mark_point(color='red', filled=True, opacity=1).encode(
-            y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale),
+            x='date:T',
+            y=alt.Y('ndvi_plot:Q', axis=None, scale=ndvi_scale),
             tooltip=[alt.Tooltip('date:T', title='Data'),
-                     alt.Tooltip('ndvi:Q', title='NDVI', format='.3f')]
+                     alt.Tooltip('ndvi:Q', title='NDVI (real)', format='.3f')]
         )
 
-        df_below = segments_below_threshold(df[['date', 'ndvi']].copy(), float(threshold))
-        red_layer = (
-            alt.Chart(df_below).mark_line(color='red', strokeWidth=3).encode(
-                x='date:T', y=alt.Y('ndvi:Q', axis=None, scale=ndvi_scale), detail='seg:N'
-            ) if not df_below.empty else
-            alt.Chart(pd.DataFrame({'date': [], 'ndvi': [], 'seg': []})).mark_line()
+        red_layer = alt.Chart(df_below_plot).mark_line(color='red', strokeWidth=3).encode(
+            x='date:T', y=alt.Y('ndvi_plot:Q', axis=None, scale=ndvi_scale), detail='seg:N'
         )
 
         chart = alt.layer(bars_precip, line_ndvi, red_layer, pts_green, pts_red
@@ -389,12 +397,13 @@ with tab2:
         )
 
         st.altair_chart(chart, use_container_width=True)
+        st.caption("Obs.: valores de NDVI < 0,20 são desenhados encostados em 0,20 apenas para visualização; o tooltip mostra o valor real.")
 
 # =====================
 # EXPORT CSV
 # =====================
 if not df.empty:
-    csv = df[['date', 'ndvi', 'precip_mm']].copy()
+    csv = df[['date','ndvi','precip_mm']].copy()
     csv['date'] = csv['date'].dt.strftime('%Y-%m')
     b64 = base64.b64encode(csv.to_csv(index=False).encode()).decode()
     st.markdown(

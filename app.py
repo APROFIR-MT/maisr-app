@@ -410,7 +410,22 @@ with tab2:
         )
 
         chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state.get('__pivot_changed', False)}"
-        st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
+        # Autosize para reagir melhor à variação de largura; padding garante espaço p/ títulos
+        chart = chart.configure_axis(
+            titlePadding=6
+                ).configure_view(
+                    strokeWidth=0
+                ).properties(
+                width='container',
+                height=360,  # ajuste se quiser
+                padding={'left': 40, 'right': 90, 'top': 10, 'bottom': 30}
+            ).configure(
+                autosize=alt.AutoSizeParams(type='fit-x', contains='padding')
+            )
+
+chart_key = f"ndvi-chart-{int(selected_pivo)}-{float(threshold):.3f}-{st.session_state['_chart_rev']}"
+st.altair_chart(chart, use_container_width=True, theme=None, key=chart_key)
+
         st.session_state["__pivot_changed"] = False
         st.caption("Curva contínua em verde. Valores em vermelho abaixo do limiar. Barras azuis mostram a precipitação mensal acumulada.")
 
